@@ -1,5 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashSet;
+use std::convert::From;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
@@ -7,6 +8,34 @@ use std::sync::{Arc, Mutex};
 
 use algebra::Algebra;
 use anyhow::Context;
+
+/// An `enum` with a variant for each method of saving data
+pub enum SaveBackend<Dir> {
+    /// Use files in a directory
+    Directory(Dir),
+}
+
+impl<Dir> SaveBackend<Dir> {
+    pub fn as_ref(&self) -> SaveBackend<&Dir> {
+        match self {
+            SaveBackend::Directory(dir) => SaveBackend::Directory(dir),
+        }
+    }
+    pub fn as_mut(&mut self) -> SaveBackend<&mut Dir> {
+        match self {
+            SaveBackend::Directory(dir) => SaveBackend::Directory(dir),
+        }
+    }
+}
+
+/// A specialized version of [SaveBackend] that is used to describe where data should be written
+pub type SaveTarget = SaveBackend<PathBuf>;
+
+impl From<PathBuf> for SaveTarget {
+    fn from(p: PathBuf) -> Self {
+        SaveBackend::Directory(p)
+    }
+}
 
 /// A DashSet<PathBuf>> of files that are currently opened and being written to. When calling this
 /// function for the first time, we set the ctrlc handler to delete currently opened files, then

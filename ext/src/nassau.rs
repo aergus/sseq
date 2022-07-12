@@ -14,14 +14,16 @@
 
 use std::fmt::Display;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::chain_complex::{
     AugmentedChainComplex, ChainComplex, FiniteChainComplex, FreeChainComplex,
 };
 use crate::utils::Timer;
-use crate::{save::SaveKind, utils::LogWriter};
+use crate::{
+    save::{SaveBackend, SaveKind, SaveTarget},
+    utils::LogWriter,
+};
 use algebra::combinatorics;
 use algebra::milnor_algebra::{MilnorAlgebra, PPartEntry};
 use algebra::module::homomorphism::{
@@ -395,7 +397,7 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     differentials: OnceVec<Arc<FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>>>,
     target: Arc<FiniteChainComplex<M>>,
     chain_maps: OnceVec<Arc<FreeModuleHomomorphism<M>>>,
-    save_dir: Option<PathBuf>,
+    save_target: Option<SaveTarget>,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -415,15 +417,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Self::new_with_save(module, None).unwrap()
     }
 
-    pub fn new_with_save(module: Arc<M>, save_dir: Option<PathBuf>) -> anyhow::Result<Self> {
+    pub fn new_with_save(module: Arc<M>, save_target: Option<SaveTarget>) -> anyhow::Result<Self> {
         let max_degree = module
             .max_degree()
             .ok_or_else(|| anyhow!("Nassau's algorithm requires bounded module"))?;
         let target = Arc::new(FiniteChainComplex::ccdz(module));
 
-        if let Some(p) = &save_dir {
-            for subdir in SaveKind::nassau_data() {
-                subdir.create_dir(p)?;
+        if let Some(backend) = &save_target {
+            match backend {
+                SaveBackend::Directory(p) => {
+                    for subdir in SaveKind::nassau_data() {
+                        subdir.create_dir(p)?;
+                    }
+                }
             }
         }
 
@@ -436,7 +442,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             chain_maps: OnceVec::new(),
             target,
             max_degree,
-            save_dir,
+            save_target,
         })
     }
 
@@ -480,7 +486,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn write_qi(
-        f: &mut Option<impl Write>,
+        handle: Option<SaveBackend<&mut impl Write>>,
         s: u32,
         t: i32,
         subalgebra: &MilnorSubalgebra,
@@ -490,60 +496,64 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         full_matrix: &Matrix,
         masked_matrix: &AugmentedMatrix<2>,
     ) -> std::io::Result<()> {
-        let f = match f {
-            Some(f) => f,
-            None => return Ok(()),
-        };
+        match handle {
+            Some(SaveBackend::Directory(f)) => {
+                let mut own_f = LogWriter::new(f);
+                let f = &mut own_f;
 
-        let mut own_f = LogWriter::new(f);
-        let f = &mut own_f;
+                let pivots = &masked_matrix.pivots()[0..masked_matrix.end[0]];
+                if !pivots.iter().any(|&x| x >= 0) {
+                    return Ok(());
+                }
 
-        let pivots = &masked_matrix.pivots()[0..masked_matrix.end[0]];
-        if !pivots.iter().any(|&x| x >= 0) {
-            return Ok(());
-        }
+                // Write signature if non-zero.
+                if signature.iter().any(|&x| x > 0) {
+                    f.write_u64::<LittleEndian>(Magic::Signature as u64)?;
+                    MilnorSubalgebra::signature_to_bytes(signature, f)?;
+                }
 
-        // Write signature if non-zero.
-        if signature.iter().any(|&x| x > 0) {
-            f.write_u64::<LittleEndian>(Magic::Signature as u64)?;
-            MilnorSubalgebra::signature_to_bytes(signature, f)?;
-        }
+                // Write quasi-inverses
+                for (col, &row) in pivots.iter().enumerate() {
+                    if row < 0 {
+                        continue;
+                    }
+                    f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
+                    let preimage = masked_matrix.row_segment(row as usize, 1, 1);
+                    scratch.set_scratch_vector_size(preimage.len());
+                    scratch.as_slice_mut().assign(preimage);
+                    scratch.to_bytes(f)?;
 
-        // Write quasi-inverses
-        for (col, &row) in pivots.iter().enumerate() {
-            if row < 0 {
-                continue;
+                    scratch.set_scratch_vector_size(full_matrix.columns());
+                    for (i, _) in preimage.iter_nonzero() {
+                        scratch.as_slice_mut().add(full_matrix.row(i), 1);
+                    }
+                    scratch.to_bytes(f)?;
+                }
+
+                own_f.finalize(format_args!(
+                    "Written quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
+                    n = t - s as i32,
+                ));
+                Ok(())
             }
-            f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
-            let preimage = masked_matrix.row_segment(row as usize, 1, 1);
-            scratch.set_scratch_vector_size(preimage.len());
-            scratch.as_slice_mut().assign(preimage);
-            scratch.to_bytes(f)?;
-
-            scratch.set_scratch_vector_size(full_matrix.columns());
-            for (i, _) in preimage.iter_nonzero() {
-                scratch.as_slice_mut().add(full_matrix.row(i), 1);
-            }
-            scratch.to_bytes(f)?;
+            None => Ok(()),
         }
-
-        own_f.finalize(format_args!(
-            "Written quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
-            n = t - s as i32,
-        ));
-        Ok(())
     }
 
     fn write_differential(&self, s: u32, t: i32, num_new_gens: usize, target_dim: usize) {
-        if let Some(dir) = &self.save_dir {
-            let mut f = self
-                .save_file(SaveKind::NassauDifferential, s, t)
-                .create_file(dir.clone(), false);
-            f.write_u64::<LittleEndian>(num_new_gens as u64).unwrap();
-            f.write_u64::<LittleEndian>(target_dim as u64).unwrap();
+        if let Some(backend) = &self.save_target {
+            match backend {
+                SaveBackend::Directory(dir) => {
+                    let mut f = self
+                        .save_file(SaveKind::NassauDifferential, s, t)
+                        .create_file(dir.clone(), false);
+                    f.write_u64::<LittleEndian>(num_new_gens as u64).unwrap();
+                    f.write_u64::<LittleEndian>(target_dim as u64).unwrap();
 
-            for n in 0..num_new_gens {
-                self.differential(s).output(t, n).to_bytes(&mut f).unwrap();
+                    for n in 0..num_new_gens {
+                        self.differential(s).output(t, n).to_bytes(&mut f).unwrap();
+                    }
+                }
             }
         }
     }
@@ -578,19 +588,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let next = &self.modules[s - 2];
         next.compute_basis(t);
 
-        let mut f = if let Some(dir) = self.save_dir() {
-            let mut f = self
-                .save_file(SaveKind::NassauQi, s - 1, t)
-                .create_file(dir.to_owned(), true);
-            f.write_u64::<LittleEndian>(next.dimension(t) as u64)
-                .unwrap();
-            f.write_u64::<LittleEndian>(target_masked_dim as u64)
-                .unwrap();
-            subalgebra.to_bytes(&mut f).unwrap();
-            Some(f)
-        } else {
-            None
-        };
+        let mut handle = self.save_target.as_ref().map(|backend| match backend {
+            SaveBackend::Directory(dir) => {
+                let mut f = self
+                    .save_file(SaveKind::NassauQi, s - 1, t)
+                    .create_file(dir.to_owned(), true);
+                f.write_u64::<LittleEndian>(next.dimension(t) as u64)
+                    .unwrap();
+                f.write_u64::<LittleEndian>(target_masked_dim as u64)
+                    .unwrap();
+                subalgebra.to_bytes(&mut f).unwrap();
+                SaveBackend::Directory(f)
+            }
+        });
 
         let next_mask: Vec<usize> = subalgebra
             .signature_mask(&algebra, &self.modules[s - 2], t, &zero_sig)
@@ -609,7 +619,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let kernel = masked_matrix.compute_kernel();
 
         Self::write_qi(
-            &mut f,
+            handle.as_mut().map(|b| b.as_mut()),
             s,
             t,
             &subalgebra,
@@ -621,9 +631,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         )
         .unwrap();
 
-        if let Some(f) = &mut f {
-            if target.max_computed_degree() < t {
-                f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
+        if let Some(handle) = &mut handle {
+            match handle {
+                SaveBackend::Directory(f) => {
+                    if target.max_computed_degree() < t {
+                        f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
+                    }
+                }
             }
         }
 
@@ -693,7 +707,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
             Self::write_qi(
-                &mut f,
+                handle.as_mut().map(|b| b.as_mut()),
                 s,
                 t,
                 &subalgebra,
@@ -712,8 +726,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         end();
 
-        if let Some(f) = &mut f {
-            f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
+        if let Some(handle) = &mut handle {
+            match handle {
+                SaveBackend::Directory(f) => {
+                    f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
+                }
+            }
         }
 
         self.write_differential(s, t, num_new_gens, target_dim);
@@ -835,32 +853,39 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return self.step0(t);
         }
 
-        if let Some(dir) = &self.save_dir {
-            if let Some(mut f) = self
-                .save_file(SaveKind::NassauDifferential, s, t)
-                .open_file(dir.clone())
-            {
-                let num_new_gens = f.read_u64::<LittleEndian>().unwrap() as usize;
-                // This need not be equal to `target_res_dimension`. If we saved a big resolution
-                // and now only want to load up to a small stem, then `target_res_dimension` will
-                // be smaller. If we have previously saved a small resolution up to a stem and now
-                // want to resolve further, it will be bigger.
-                let saved_target_res_dimension = f.read_u64::<LittleEndian>().unwrap() as usize;
+        if let Some(backend) = &self.save_target {
+            match backend {
+                SaveBackend::Directory(dir) => {
+                    if let Some(mut f) = self
+                        .save_file(SaveKind::NassauDifferential, s, t)
+                        .open_file(dir.clone())
+                    {
+                        let num_new_gens = f.read_u64::<LittleEndian>().unwrap() as usize;
+                        // This need not be equal to `target_res_dimension`. If we saved a big resolution
+                        // and now only want to load up to a small stem, then `target_res_dimension` will
+                        // be smaller. If we have previously saved a small resolution up to a stem and now
+                        // want to resolve further, it will be bigger.
+                        let saved_target_res_dimension =
+                            f.read_u64::<LittleEndian>().unwrap() as usize;
 
-                self.modules[s].add_generators(t, num_new_gens, None);
+                        self.modules[s].add_generators(t, num_new_gens, None);
 
-                let mut d_targets = Vec::with_capacity(num_new_gens);
+                        let mut d_targets = Vec::with_capacity(num_new_gens);
 
-                for _ in 0..num_new_gens {
-                    d_targets
-                        .push(FpVector::from_bytes(p, saved_target_res_dimension, &mut f).unwrap());
+                        for _ in 0..num_new_gens {
+                            d_targets.push(
+                                FpVector::from_bytes(p, saved_target_res_dimension, &mut f)
+                                    .unwrap(),
+                            );
+                        }
+
+                        self.differentials[s].add_generators_from_rows(t, d_targets);
+
+                        set_data();
+
+                        return;
+                    }
                 }
-
-                self.differentials[s].add_generators_from_rows(t, d_targets);
-
-                set_data();
-
-                return;
             }
         }
 
@@ -999,7 +1024,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
     }
 
     fn save_dir(&self) -> Option<&std::path::Path> {
-        self.save_dir.as_deref()
+        self.save_target.as_ref().map(|backend| match backend {
+            SaveBackend::Directory(dir) => dir.as_ref(),
+        })
     }
 
     fn apply_quasi_inverse<T, S>(&self, results: &mut [T], s: u32, t: i32, inputs: &[S]) -> bool
@@ -1007,14 +1034,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<SliceMut<'a>>,
         for<'a> &'a S: Into<Slice<'a>>,
     {
-        let mut f = if let Some(dir) = &self.save_dir {
-            if let Some(f) = self
-                .save_file(SaveKind::NassauQi, s, t)
-                .open_file(dir.clone())
-            {
-                f
-            } else {
-                return false;
+        let mut handle = if let Some(backend) = &self.save_target {
+            match backend {
+                SaveBackend::Directory(dir) => {
+                    if let Some(f) = self
+                        .save_file(SaveKind::NassauQi, s, t)
+                        .open_file(dir.clone())
+                    {
+                        SaveBackend::Directory(f)
+                    } else {
+                        return false;
+                    }
+                }
             }
         } else {
             return false;
@@ -1022,9 +1053,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
 
         let p = self.prime();
 
-        let target_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
-        let zero_mask_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
-        let subalgebra = MilnorSubalgebra::from_bytes(&mut f).unwrap();
+        let (target_dim, zero_mask_dim, subalgebra) = match handle {
+            SaveBackend::Directory(ref mut f) => {
+                let target_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
+                let zero_mask_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
+                let subalgebra = MilnorSubalgebra::from_bytes(f).unwrap();
+                (target_dim, zero_mask_dim, subalgebra)
+            }
+        };
         let source = &self.modules[s];
         let target = &self.modules[s - 1];
         let algebra = target.algebra();
@@ -1084,11 +1120,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         };
 
         loop {
-            let col = f.read_u64::<LittleEndian>().unwrap() as usize;
+            let col = match handle {
+                SaveBackend::Directory(ref mut f) => f.read_u64::<LittleEndian>().unwrap() as usize,
+            };
             if col == Magic::End as usize {
                 break;
             } else if col == Magic::Signature as usize {
-                let signature = subalgebra.signature_from_bytes(&mut f).unwrap();
+                let signature = match handle {
+                    SaveBackend::Directory(ref mut f) => {
+                        subalgebra.signature_from_bytes(f).unwrap()
+                    }
+                };
 
                 mask.clear();
                 mask.extend(subalgebra.signature_mask(&algebra, source, t, &signature));
@@ -1128,8 +1170,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 target_zero_mask = Vec::new();
                 dx_matrix = AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]);
             } else {
-                scratch0.update_from_bytes(&mut f).unwrap();
-                scratch1.update_from_bytes(&mut f).unwrap();
+                match handle {
+                    SaveBackend::Directory(ref mut f) => {
+                        scratch0.update_from_bytes(f).unwrap();
+                        scratch1.update_from_bytes(f).unwrap();
+                    }
+                }
                 for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
                     let entry = input.entry(col);
                     if entry != 0 {
@@ -1158,8 +1204,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 }
             }
         }
-        // Make sure we have finished reading everything
-        drop(f);
+        match handle {
+            // Make sure we have finished reading everything
+            SaveBackend::Directory(f) => drop(f),
+        }
 
         for dx in inputs {
             assert!(
