@@ -21,7 +21,7 @@ use crate::chain_complex::{
 };
 use crate::utils::Timer;
 use crate::{
-    save::{SaveBackend, SaveKind, SaveTarget},
+    save::{SaveBackend, SaveBackend_, SaveKind, SaveTarget},
     utils::LogWriter,
 };
 use algebra::combinatorics;
@@ -41,6 +41,9 @@ use once::OnceVec;
 
 #[cfg(feature = "concurrent")]
 use std::sync::mpsc;
+
+#[cfg(feature = "database")]
+use postgres::Client as PostgresClient;
 
 #[cfg(feature = "concurrent")]
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
@@ -425,11 +428,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if let Some(backend) = &save_target {
             match backend {
-                SaveBackend::Directory(p) => {
+                SaveBackend::Files(p) => {
                     for subdir in SaveKind::nassau_data() {
                         subdir.create_dir(p)?;
                     }
                 }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             }
         }
 
@@ -486,7 +491,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn write_qi(
-        handle: Option<SaveBackend<&mut impl Write>>,
+        handle: Option<SaveBackend_!(&mut impl Write, &mut PostgresClient)>,
         s: u32,
         t: i32,
         subalgebra: &MilnorSubalgebra,
@@ -497,7 +502,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         masked_matrix: &AugmentedMatrix<2>,
     ) -> std::io::Result<()> {
         match handle {
-            Some(SaveBackend::Directory(f)) => {
+            Some(SaveBackend::Files(f)) => {
                 let mut own_f = LogWriter::new(f);
                 let f = &mut own_f;
 
@@ -536,6 +541,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 ));
                 Ok(())
             }
+            #[cfg(feature = "database")]
+            Some(SaveBackend::Database(_)) => todo!(),
             None => Ok(()),
         }
     }
@@ -543,7 +550,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     fn write_differential(&self, s: u32, t: i32, num_new_gens: usize, target_dim: usize) {
         if let Some(backend) = &self.save_target {
             match backend {
-                SaveBackend::Directory(dir) => {
+                SaveBackend::Files(dir) => {
                     let mut f = self
                         .save_file(SaveKind::NassauDifferential, s, t)
                         .create_file(dir.clone(), false);
@@ -554,6 +561,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         self.differential(s).output(t, n).to_bytes(&mut f).unwrap();
                     }
                 }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             }
         }
     }
@@ -589,7 +598,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         next.compute_basis(t);
 
         let mut handle = self.save_target.as_ref().map(|backend| match backend {
-            SaveBackend::Directory(dir) => {
+            SaveBackend::Files(dir) => {
                 let mut f = self
                     .save_file(SaveKind::NassauQi, s - 1, t)
                     .create_file(dir.to_owned(), true);
@@ -598,8 +607,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 f.write_u64::<LittleEndian>(target_masked_dim as u64)
                     .unwrap();
                 subalgebra.to_bytes(&mut f).unwrap();
-                SaveBackend::Directory(f)
+                SaveBackend::Files(f)
             }
+            #[cfg(feature = "database")]
+            SaveBackend::Database(_) => todo!(),
         });
 
         let next_mask: Vec<usize> = subalgebra
@@ -633,11 +644,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if let Some(handle) = &mut handle {
             match handle {
-                SaveBackend::Directory(f) => {
+                SaveBackend::Files(f) => {
                     if target.max_computed_degree() < t {
                         f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
                     }
                 }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             }
         }
 
@@ -728,9 +741,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if let Some(handle) = &mut handle {
             match handle {
-                SaveBackend::Directory(f) => {
+                SaveBackend::Files(f) => {
                     f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
                 }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             }
         }
 
@@ -855,7 +870,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         if let Some(backend) = &self.save_target {
             match backend {
-                SaveBackend::Directory(dir) => {
+                SaveBackend::Files(dir) => {
                     if let Some(mut f) = self
                         .save_file(SaveKind::NassauDifferential, s, t)
                         .open_file(dir.clone())
@@ -886,6 +901,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         return;
                     }
                 }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             }
         }
 
@@ -1024,8 +1041,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
     }
 
     fn save_dir(&self) -> Option<&std::path::Path> {
-        self.save_target.as_ref().map(|backend| match backend {
-            SaveBackend::Directory(dir) => dir.as_ref(),
+        self.save_target.as_ref().and_then(|backend| match backend {
+            SaveBackend::Files(dir) => Some(dir.as_ref()),
+            #[cfg(feature = "database")]
+            _ => None,
         })
     }
 
@@ -1034,18 +1053,20 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<SliceMut<'a>>,
         for<'a> &'a S: Into<Slice<'a>>,
     {
-        let mut handle = if let Some(backend) = &self.save_target {
+        let mut handle: SaveBackend_!(_, ()) = if let Some(backend) = &self.save_target {
             match backend {
-                SaveBackend::Directory(dir) => {
+                SaveBackend::Files(dir) => {
                     if let Some(f) = self
                         .save_file(SaveKind::NassauQi, s, t)
                         .open_file(dir.clone())
                     {
-                        SaveBackend::Directory(f)
+                        SaveBackend::Files(f)
                     } else {
                         return false;
                     }
                 }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             }
         } else {
             return false;
@@ -1054,12 +1075,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         let p = self.prime();
 
         let (target_dim, zero_mask_dim, subalgebra) = match handle {
-            SaveBackend::Directory(ref mut f) => {
+            SaveBackend::Files(ref mut f) => {
                 let target_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
                 let zero_mask_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
                 let subalgebra = MilnorSubalgebra::from_bytes(f).unwrap();
                 (target_dim, zero_mask_dim, subalgebra)
             }
+            #[cfg(feature = "database")]
+            SaveBackend::Database(_) => todo!(),
         };
         let source = &self.modules[s];
         let target = &self.modules[s - 1];
@@ -1121,15 +1144,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
 
         loop {
             let col = match handle {
-                SaveBackend::Directory(ref mut f) => f.read_u64::<LittleEndian>().unwrap() as usize,
+                SaveBackend::Files(ref mut f) => f.read_u64::<LittleEndian>().unwrap() as usize,
+                #[cfg(feature = "database")]
+                SaveBackend::Database(_) => todo!(),
             };
             if col == Magic::End as usize {
                 break;
             } else if col == Magic::Signature as usize {
                 let signature = match handle {
-                    SaveBackend::Directory(ref mut f) => {
-                        subalgebra.signature_from_bytes(f).unwrap()
-                    }
+                    SaveBackend::Files(ref mut f) => subalgebra.signature_from_bytes(f).unwrap(),
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(_) => todo!(),
                 };
 
                 mask.clear();
@@ -1171,10 +1196,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 dx_matrix = AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]);
             } else {
                 match handle {
-                    SaveBackend::Directory(ref mut f) => {
+                    SaveBackend::Files(ref mut f) => {
                         scratch0.update_from_bytes(f).unwrap();
                         scratch1.update_from_bytes(f).unwrap();
                     }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(_) => todo!(),
                 }
                 for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
                     let entry = input.entry(col);
@@ -1206,7 +1233,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         }
         match handle {
             // Make sure we have finished reading everything
-            SaveBackend::Directory(f) => drop(f),
+            SaveBackend::Files(f) => drop(f),
+            #[cfg(feature = "database")]
+            SaveBackend::Database(_) => todo!(),
         }
 
         for dx in inputs {

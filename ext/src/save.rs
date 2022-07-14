@@ -9,31 +9,63 @@ use std::sync::{Arc, Mutex};
 use algebra::Algebra;
 use anyhow::Context;
 
+#[cfg(feature = "database")]
+use postgres::Config as PostgresConfig;
+
 /// An `enum` with a variant for each method of saving data
-pub enum SaveBackend<Dir> {
+pub enum SaveBackend<F, #[cfg(feature = "database")] D> {
     /// Use files in a directory
-    Directory(Dir),
+    Files(F),
+    #[cfg(feature = "database")]
+    /// Use a (Postgres) database
+    Database(D),
 }
 
-impl<Dir> SaveBackend<Dir> {
-    pub fn as_ref(&self) -> SaveBackend<&Dir> {
+// While declaring a different number of generic parameters based on a `cfg` directive is possible
+// (cf. how the parameter `D` is handled in the enum `SaveBackend`), *instantiating* a different
+// number of generic parameters based on a `cfg` directive doesn't seem to be possible (as of Rust
+// 1.62.0), i.e., `SaveBackend<F, #[cfg(feature = "database")] D>` is not accepted in `impl` block
+// headers and function arguments.
+// We therefore use macros that insert the correct instantiation based on which features are
+// enabled.
+
+#[cfg(not(feature = "database"))]
+macro_rules! SaveBackend_ {($f:ty, $_:ty) => {SaveBackend<$f>}}
+#[cfg(feature = "database")]
+macro_rules! SaveBackend_ {($f:ty, $d:ty) => {SaveBackend<$f, $d>}}
+
+pub(crate) use SaveBackend_;
+
+impl<F, #[cfg(feature = "database")] D> SaveBackend_!(F, D) {
+    pub fn as_ref(&self) -> SaveBackend_!(&F, &D) {
         match self {
-            SaveBackend::Directory(dir) => SaveBackend::Directory(dir),
+            Self::Files(fs) => SaveBackend::Files(fs),
+            #[cfg(feature = "database")]
+            Self::Database(db) => SaveBackend::Database(db),
         }
     }
-    pub fn as_mut(&mut self) -> SaveBackend<&mut Dir> {
+    pub fn as_mut(&mut self) -> SaveBackend_!(&mut F, &mut D) {
         match self {
-            SaveBackend::Directory(dir) => SaveBackend::Directory(dir),
+            Self::Files(fs) => SaveBackend::Files(fs),
+            #[cfg(feature = "database")]
+            Self::Database(db) => SaveBackend::Database(db),
         }
     }
 }
 
 /// A specialized version of [SaveBackend] that is used to describe where data should be written
-pub type SaveTarget = SaveBackend<PathBuf>;
+pub type SaveTarget = SaveBackend_!(PathBuf, PostgresConfig);
 
 impl From<PathBuf> for SaveTarget {
     fn from(p: PathBuf) -> Self {
-        SaveBackend::Directory(p)
+        SaveBackend::Files(p)
+    }
+}
+
+#[cfg(feature = "database")]
+impl From<PostgresConfig> for SaveTarget {
+    fn from(cfg: PostgresConfig) -> Self {
+        SaveBackend::Database(cfg)
     }
 }
 
