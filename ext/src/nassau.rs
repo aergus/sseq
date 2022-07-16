@@ -43,7 +43,9 @@ use once::OnceVec;
 use std::sync::mpsc;
 
 #[cfg(feature = "database")]
-use postgres::types::Type as PostgresType;
+use crate::save::PostgresConnection;
+#[cfg(feature = "database")]
+use r2d2_postgres::{postgres, postgres::types::Type as PostgresType};
 
 #[cfg(feature = "concurrent")]
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
@@ -80,7 +82,7 @@ struct PostgresQiWriteHandle<'a, 'b> {
 #[cfg(feature = "database")]
 /// Some data that we need to pass around while reading quasi-inverses from the database
 struct PostgresQiReadHandle {
-    client: postgres::Client,
+    connection: PostgresConnection,
     command_rows: Vec<postgres::Row>,
     command_index: usize,
     signature_statement: postgres::Statement,
@@ -459,7 +461,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let target = Arc::new(FiniteChainComplex::ccdz(module));
 
         if let Some(backend) = &save_target {
-            let mut backend = backend.connect_if_database();
+            let mut backend = backend.get_connection_if_database();
             match &mut backend {
                 SaveBackend::Files(p) => {
                     for subdir in SaveKind::nassau_data() {
@@ -467,9 +469,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(client) => {
+                SaveBackend::Database(connection) => {
                     for kind in SaveKind::nassau_data() {
-                        kind.initialize_database(client)?;
+                        kind.initialize_database(connection)?;
                     }
                 }
             }
@@ -708,7 +710,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
     fn write_differential(&self, s: u32, t: i32, num_new_gens: usize, target_dim: usize) {
         if let Some(backend) = &self.save_target {
-            let backend = backend.connect_if_database();
+            let backend = backend.get_connection_if_database();
             match backend {
                 SaveBackend::Files(dir) => {
                     let mut f = self
@@ -722,10 +724,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(mut client) => {
+                SaveBackend::Database(mut connection) => {
                     // To emulate a non-overwriting behavior, if the metadata for this differential
                     // already exists, we just do some validity checks and return.
-                    let row = client
+                    let row = connection
                         .query_opt(
                             "
                             SELECT num_gens, target_dim, s, t
@@ -740,7 +742,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         return;
                     }
 
-                    let mut transaction = client.transaction().unwrap();
+                    let mut transaction = connection.transaction().unwrap();
 
                     transaction
                         .execute(
@@ -818,7 +820,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let mut save_target = self
             .save_target
             .as_ref()
-            .map(|backend| backend.connect_if_database());
+            .map(|backend| backend.get_connection_if_database());
         let mut handle = save_target.as_mut().map(|backend| {
             match backend {
                 SaveBackend::Files(dir) => {
@@ -833,19 +835,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     SaveBackend::Files(f)
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(client) => {
+                SaveBackend::Database(connection) => {
                     // We delete existing data for this bidegree to emulate the
                     // overwriting behavior.
                     // Deleting the metadata is sufficient because the rest will
                     // be cleaned up by the `CASCADE` mechanism.
-                    client
+                    connection
                         .execute(
                             "DELETE FROM nassau_qi.metadata WHERE s = $1 AND t = $2",
                             &[&s, &t],
                         )
                         .unwrap();
 
-                    let mut transaction = client.transaction().unwrap();
+                    let mut transaction = connection.transaction().unwrap();
 
                     transaction
                         .execute(
@@ -1146,7 +1148,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         }
 
         if let Some(backend) = &self.save_target {
-            let mut backend = backend.connect_if_database();
+            let mut backend = backend.get_connection_if_database();
 
             let initialization = match &mut backend {
                 SaveBackend::Files(dir) => self
@@ -1158,8 +1160,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         (SaveBackend::Files(f), num, dim)
                     }),
                 #[cfg(feature = "database")]
-                SaveBackend::Database(client) => {
-                    let mut transaction = client
+                SaveBackend::Database(connection) => {
+                    let mut transaction = connection
                         .build_transaction()
                         .read_only(true)
                         .isolation_level(postgres::IsolationLevel::Serializable)
@@ -1381,7 +1383,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
     {
         let (target_dim, zero_mask_dim, subalgebra, mut handle) =
             if let Some(backend) = &self.save_target {
-                let backend = backend.connect_if_database();
+                let backend = backend.get_connection_if_database();
                 match backend {
                     SaveBackend::Files(dir) => {
                         if let Some(mut f) = self
@@ -1397,8 +1399,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                         }
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(mut client) => {
-                        let mut transaction = client
+                    SaveBackend::Database(mut connection) => {
+                        let mut transaction = connection
                             .build_transaction()
                             .read_only(true)
                             .isolation_level(postgres::IsolationLevel::Serializable)
@@ -1433,17 +1435,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             transaction.commit().unwrap();
                             let command_index = 0;
 
-                            let signature_statement = client.prepare_typed(
+                            let signature_statement = connection.prepare_typed(
                                 "SELECT entries FROM nassau_qi.signatures WHERE command_id = $1",
                                 &[PostgresType::INT8],
                             ).unwrap();
-                            let lift_statement = client
+                            let lift_statement = connection
                                 .prepare_typed(
                                     "SELECT bytes FROM nassau_qi.lifts WHERE command_id = $1",
                                     &[PostgresType::INT8],
                                 )
                                 .unwrap();
-                            let image_statement = client
+                            let image_statement = connection
                                 .prepare_typed(
                                     "SELECT bytes FROM nassau_qi.images WHERE command_id = $1",
                                     &[PostgresType::INT8],
@@ -1455,7 +1457,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                                 zero_mask_dim,
                                 subalgebra,
                                 SaveBackend::Database(PostgresQiReadHandle {
-                                    client,
+                                    connection,
                                     signature_statement,
                                     lift_statement,
                                     image_statement,
@@ -1547,7 +1549,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     SaveBackend::Database(handle) => {
                         let id = handle.current_id();
                         let row = handle
-                            .client
+                            .connection
                             .query_one(&handle.signature_statement, &[&id])
                             .unwrap();
                         match std::mem::size_of::<PPartEntry>() {
@@ -1612,14 +1614,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     SaveBackend::Database(handle) => {
                         let id = handle.current_id();
                         let row = handle
-                            .client
+                            .connection
                             .query_one(&handle.lift_statement, &[&id])
                             .unwrap();
                         scratch0
                             .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])
                             .unwrap();
                         let row = handle
-                            .client
+                            .connection
                             .query_one(&handle.image_statement, &[&id])
                             .unwrap();
                         scratch1

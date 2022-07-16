@@ -11,6 +11,8 @@ use anyhow::Context;
 
 #[cfg(feature = "database")]
 use algebra::milnor_algebra::PPartEntry;
+#[cfg(feature = "database")]
+use r2d2_postgres::{postgres, r2d2, PostgresConnectionManager};
 
 /// An `enum` with a variant for each method of saving data
 pub enum SaveBackend<F, #[cfg(feature = "database")] D> {
@@ -53,8 +55,13 @@ impl<F, #[cfg(feature = "database")] D> SaveBackend_!(F, D) {
     }
 }
 
+#[cfg(feature = "database")]
+pub type PostgresPool = r2d2::Pool<PostgresConnectionManager<postgres::NoTls>>;
+#[cfg(feature = "database")]
+pub type PostgresConnection = r2d2::PooledConnection<PostgresConnectionManager<postgres::NoTls>>;
+
 /// A specialized version of [SaveBackend] that is used to describe where data should be written
-pub type SaveTarget = SaveBackend_!(PathBuf, postgres::Config);
+pub type SaveTarget = SaveBackend_!(PathBuf, PostgresPool);
 
 impl From<PathBuf> for SaveTarget {
     fn from(p: PathBuf) -> Self {
@@ -62,26 +69,19 @@ impl From<PathBuf> for SaveTarget {
     }
 }
 
-#[cfg(feature = "database")]
-impl From<postgres::Config> for SaveTarget {
-    fn from(cfg: postgres::Config) -> Self {
-        SaveBackend::Database(cfg)
-    }
-}
-
-/// When using databases, converts the database configuration variant to a database client variant
-///
-/// We use this to start connections instead of connecting in an appropriate `match`
-/// arm because we cannot move a transaction out of the block in which its parent client was
-/// created.
-impl<F> SaveBackend_!(F, postgres::Config) {
-    pub fn connect_if_database(&self) -> SaveBackend_!(&F, postgres::Client) {
+impl<F> SaveBackend_!(F, PostgresPool) {
+    /// When the `database` feature is enabled, this function `get`s a connection from the pool
+    /// in the [SaveBackend::Database] variant, and for other variants, it behaves like
+    /// [SaveBackend::as_ref].
+    ///
+    /// We use this to obtain connections instead of calling [PostgresPool::get] in an appropriate
+    /// `match` arm because we cannot move a transaction out of the block in which its parent
+    /// connection was created.
+    pub fn get_connection_if_database(&self) -> SaveBackend_!(&F, PostgresConnection) {
         match self {
             Self::Files(x) => SaveBackend::Files(x),
             #[cfg(feature = "database")]
-            Self::Database(config) => {
-                SaveBackend::Database(config.connect(postgres::NoTls).unwrap())
-            }
+            Self::Database(pool) => SaveBackend::Database(pool.get().unwrap()),
         }
     }
 }
