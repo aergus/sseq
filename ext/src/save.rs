@@ -262,7 +262,7 @@ impl SaveKind {
                         id BIGSERIAL PRIMARY KEY NOT NULL,
                         s OID NOT NULL,
                         t INT NOT NULL,
-                        command BIGINT NOT NULL,
+                        magic BIGINT NOT NULL,
                         FOREIGN KEY (s, t)
                             REFERENCES nassau_qi.metadata(s,t) ON DELETE CASCADE
                     );

@@ -70,13 +70,14 @@ impl SenderData {
 
 #[cfg(feature = "database")]
 /// Some data that we need to pass around while writing quasi-inverses into the database
-struct PostgresQiWriteHandle<'a, 'b> {
-    timer: Timer,
-    transaction: &'a mut postgres::Transaction<'b>,
-    /// Buffer for byte arrays representing `FpVector`s.
-    buffer: Vec<u8>,
+struct PostgresQiWriteHandle<'a> {
+    transaction: postgres::Transaction<'a>,
+    command_statement: postgres::Statement,
+    signature_statement: postgres::Statement,
     lift_statement: postgres::Statement,
     image_statement: postgres::Statement,
+    /// Buffer for byte arrays representing `FpVector`s.
+    buffer: Vec<u8>,
 }
 
 #[cfg(feature = "database")]
@@ -530,7 +531,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn write_qi(
-        handle: Option<SaveBackend_!(&mut impl Write, &mut postgres::Transaction)>,
+        handle: Option<SaveBackend_!(&mut impl Write, &mut PostgresQiWriteHandle)>,
         s: u32,
         t: i32,
         subalgebra: &MilnorSubalgebra,
@@ -544,24 +545,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let mut handle = match handle {
                 SaveBackend::Files(f) => SaveBackend::Files(LogWriter::new(f)),
                 #[cfg(feature = "database")]
-                SaveBackend::Database(transaction) => {
+                SaveBackend::Database(handle) => {
                     let timer = Timer::start();
-                    let buffer: Vec<u8> = Vec::new();
-                    let lift_statement = transaction.prepare_typed(
-                        "INSERT INTO nassau_qi.lifts(command_id, bytes) VALUES ($1, $2)",
-                        &[PostgresType::INT8, PostgresType::BYTEA],
-                    )?;
-                    let image_statement = transaction.prepare_typed(
-                        "INSERT INTO nassau_qi.images(command_id, bytes) VALUES ($1, $2)",
-                        &[PostgresType::INT8, PostgresType::BYTEA],
-                    )?;
-                    SaveBackend::Database(PostgresQiWriteHandle {
-                        timer,
-                        transaction,
-                        buffer,
-                        lift_statement,
-                        image_statement,
-                    })
+                    SaveBackend::Database((handle, timer))
                 }
             };
 
@@ -578,14 +564,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         MilnorSubalgebra::signature_to_bytes(signature, f)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(handle) => {
+                    SaveBackend::Database((handle, _)) => {
                         let id = handle
                             .transaction
                             .query_one(
-                                "
-                                INSERT INTO nassau_qi.commands(s, t, command)
-                                    VALUES ($1, $2, $3) RETURNING id
-                                ",
+                                &handle.command_statement,
                                 &[&s, &t, &(Magic::Signature as i64)],
                             )?
                             .get::<_, i64>(0);
@@ -598,13 +581,9 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                         signature.len(),
                                     )
                                 };
-                                handle.transaction.execute(
-                                    "
-                                    INSERT INTO nassau_qi.signatures(command_id, entries)
-                                        VALUES ($1, $2)
-                                    ",
-                                    &[&id, &transmuted],
-                                )?;
+                                handle
+                                    .transaction
+                                    .execute(&handle.signature_statement, &[&id, &transmuted])?;
                             }
                             4 => {
                                 handle.transaction.execute(
@@ -633,14 +612,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         SaveBackend::Files(f)
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(handle) => {
+                    SaveBackend::Database((handle, _)) => {
                         let id = handle
                             .transaction
                             .query_one(
-                                "
-                                INSERT INTO nassau_qi.commands(s, t, command)
-                                    VALUES ($1, $2, $3) RETURNING id
-                                ",
+                                &handle.command_statement,
                                 &[&s, &t, &(next_mask[col] as i64)],
                             )?
                             .get::<_, i64>(0);
@@ -692,8 +668,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     ));
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(handle) => {
-                    handle.timer.end(
+                SaveBackend::Database((_, timer)) => {
+                    timer.end(
                         format_args!(
                             "Inserted quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
                             n = t - s as i32,
@@ -866,7 +842,38 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         )
                         .unwrap();
 
-                    SaveBackend::Database(transaction)
+                    let command_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.commands(s, t, magic) VALUES ($1, $2, $3) RETURNING id",
+                        &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
+                    ).unwrap();
+                    let entries_type = match std::mem::size_of::<PPartEntry>() {
+                        2 => PostgresType::INT2_ARRAY,
+                        4 => PostgresType::OID_ARRAY,
+                        _ => unreachable!(),
+                    };
+                    let signature_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.signatures(command_id, entries) VALUES ($1, $2)",
+                        &[PostgresType::INT8, entries_type],
+                    ).unwrap();
+                    let lift_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.lifts(command_id, bytes) VALUES ($1, $2)",
+                        &[PostgresType::INT8, PostgresType::BYTEA],
+                    ).unwrap();
+                    let image_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.images(command_id, bytes) VALUES ($1, $2)",
+                        &[PostgresType::INT8, PostgresType::BYTEA],
+                    ).unwrap();
+
+                    let buffer: Vec<u8> = Vec::new();
+
+                    SaveBackend::Database(PostgresQiWriteHandle {
+                        transaction,
+                        signature_statement,
+                        command_statement,
+                        lift_statement,
+                        image_statement,
+                        buffer,
+                    })
                 }
             }
         });
@@ -907,15 +914,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(transaction) => {
-                        transaction
-                            .execute(
-                                "
-                                INSERT INTO nassau_qi.commands(s, t, command)
-                                    VALUES ($1, $2, $3)
-                                ",
-                                &[&s, &t, &(Magic::Fix as i64)],
-                            )
+                    SaveBackend::Database(handle) => {
+                        handle
+                            .transaction
+                            .execute(&handle.command_statement, &[&s, &t, &(Magic::Fix as i64)])
                             .unwrap();
                     }
                 }
@@ -1013,17 +1015,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(mut transaction) => {
-                    transaction
-                        .execute(
-                            "
-                            INSERT INTO nassau_qi.commands(s, t, command)
-                                VALUES ($1, $2, $3)
-                            ",
-                            &[&s, &t, &(Magic::End as i64)],
-                        )
+                SaveBackend::Database(mut handle) => {
+                    handle
+                        .transaction
+                        .execute(&handle.command_statement, &[&s, &t, &(Magic::End as i64)])
                         .unwrap();
-                    transaction.commit().unwrap();
+                    handle.transaction.commit().unwrap();
                 }
             }
         }
@@ -1423,7 +1420,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             let command_rows = transaction
                                 .query(
                                     "
-                                    SELECT command, id FROM nassau_qi.commands
+                                    SELECT magic, id FROM nassau_qi.commands
                                         WHERE s = $1 AND t = $2 ORDER BY id ASC
                                     ",
                                     &[&s, &t],
