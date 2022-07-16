@@ -10,7 +10,7 @@ use algebra::Algebra;
 use anyhow::Context;
 
 #[cfg(feature = "database")]
-use postgres::Config as PostgresConfig;
+use algebra::milnor_algebra::PPartEntry;
 
 /// An `enum` with a variant for each method of saving data
 pub enum SaveBackend<F, #[cfg(feature = "database")] D> {
@@ -54,7 +54,7 @@ impl<F, #[cfg(feature = "database")] D> SaveBackend_!(F, D) {
 }
 
 /// A specialized version of [SaveBackend] that is used to describe where data should be written
-pub type SaveTarget = SaveBackend_!(PathBuf, PostgresConfig);
+pub type SaveTarget = SaveBackend_!(PathBuf, postgres::Config);
 
 impl From<PathBuf> for SaveTarget {
     fn from(p: PathBuf) -> Self {
@@ -63,9 +63,26 @@ impl From<PathBuf> for SaveTarget {
 }
 
 #[cfg(feature = "database")]
-impl From<PostgresConfig> for SaveTarget {
-    fn from(cfg: PostgresConfig) -> Self {
+impl From<postgres::Config> for SaveTarget {
+    fn from(cfg: postgres::Config) -> Self {
         SaveBackend::Database(cfg)
+    }
+}
+
+/// When using databases, converts the database configuration variant to a database client variant
+///
+/// We use this to start connections instead of connecting in an appropriate `match`
+/// arm because we cannot move a transaction out of the block in which its parent client was
+/// created.
+impl<F> SaveBackend_!(F, postgres::Config) {
+    pub fn connect_if_database(&self) -> SaveBackend_!(&F, postgres::Client) {
+        match self {
+            Self::Files(x) => SaveBackend::Files(x),
+            #[cfg(feature = "database")]
+            Self::Database(config) => {
+                SaveBackend::Database(config.connect(postgres::NoTls).unwrap())
+            }
+        }
     }
 }
 
@@ -197,6 +214,79 @@ impl SaveKind {
             return Err(anyhow::anyhow!("{p:?} is not a directory"));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "database")]
+    pub fn initialize_database(self, conn: &mut postgres::Client) -> Result<(), postgres::Error> {
+        // Taking a detour through `String` because we have to format things...
+        let query = match self {
+            Self::NassauDifferential => String::from(
+                "
+                CREATE SCHEMA IF NOT EXISTS nassau_differential;
+                CREATE TABLE IF NOT EXISTS nassau_differential.metadata (
+                    s OID NOT NULL,
+                    t INT NOT NULL,
+                    num_gens BIGINT NOT NULL,
+                    target_dim BIGINT NOT NULL,
+                    PRIMARY KEY(s, t)
+                );
+                CREATE TABLE IF NOT EXISTS nassau_differential.vectors (
+                    s OID NOT NULL,
+                    t INT NOT NULL,
+                    i BIGINT NOT NULL,
+                    bytes BYTEA NOT NULL,
+                    PRIMARY KEY (s, t, i),
+                    FOREIGN KEY (s, t)
+                        REFERENCES nassau_differential.metadata(s,t) ON DELETE CASCADE
+                )
+                ",
+            ),
+            Self::NassauQi => {
+                let entry_type = match std::mem::size_of::<PPartEntry>() {
+                    2 => "SMALLINT",
+                    4 => "OID",
+                    _ => unreachable!(),
+                };
+                format!(
+                    "
+                    CREATE SCHEMA IF NOT EXISTS nassau_qi;
+                    CREATE TABLE IF NOT EXISTS nassau_qi.metadata (
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        target_dim BIGINT NOT NULL,
+                        target_masked_dim BIGINT NOT NULL,
+                        subalgebra_profile BYTEA NOT NULL,
+                        PRIMARY KEY (s, t)
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.commands (
+                        id BIGSERIAL PRIMARY KEY NOT NULL,
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        command BIGINT NOT NULL,
+                        FOREIGN KEY (s, t)
+                            REFERENCES nassau_qi.metadata(s,t) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.signatures (
+                        command_id BIGSERIAL NOT NULL
+                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
+                        entries {entry_type}[] NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.lifts (
+                        command_id BIGSERIAL NOT NULL
+                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
+                        bytes BYTEA NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.images (
+                        command_id BIGSERIAL NOT NULL
+                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
+                        bytes BYTEA
+                    );
+                    "
+                )
+            }
+            _ => todo!(),
+        };
+        conn.batch_execute(&query)
     }
 }
 
