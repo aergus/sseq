@@ -573,28 +573,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             )?
                             .get::<_, i64>(0);
 
-                        match std::mem::size_of::<PPartEntry>() {
-                            2 => {
-                                let transmuted = unsafe {
-                                    std::slice::from_raw_parts(
-                                        signature.as_ptr() as *const i16,
-                                        signature.len(),
-                                    )
-                                };
-                                handle
-                                    .transaction
-                                    .execute(&handle.signature_statement, &[&id, &transmuted])?;
-                            }
-                            4 => {
-                                handle.transaction.execute(
-                                    "
-                                    INSERT INTO nassau_qi.signatures(command_id, entries)
-                                        VALUES ($1, $2)
-                                    ",
-                                    &[&id, &signature],
-                                )?;
-                            }
-                            _ => unreachable!(),
+                        #[cfg(feature = "odd-primes")]
+                        handle
+                            .transaction
+                            .execute(&handle.signature_statement, &[&id, &signature])?;
+                        #[cfg(not(feature = "odd-primes"))]
+                        {
+                            let transmuted = unsafe {
+                                std::slice::from_raw_parts(
+                                    signature.as_ptr() as *const i16,
+                                    signature.len(),
+                                )
+                            };
+                            handle
+                                .transaction
+                                .execute(&handle.signature_statement, &[&id, &transmuted])?;
                         }
                     }
                 }
@@ -1549,18 +1542,20 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             .connection
                             .query_one(&handle.signature_statement, &[&id])
                             .unwrap();
-                        match std::mem::size_of::<PPartEntry>() {
-                            2 => {
-                                let mut v = std::mem::ManuallyDrop::new(row.get::<_, Vec<i16>>(0));
-                                let len = v.len();
-                                let cap = v.capacity();
-                                unsafe {
-                                    Vec::from_raw_parts(v.as_mut_ptr() as *mut PPartEntry, len, cap)
-                                }
+
+                        #[cfg(feature = "odd-primes")]
+                        let result = row.get(0);
+                        #[cfg(not(feature = "odd-primes"))]
+                        let result = {
+                            let mut v = std::mem::ManuallyDrop::new(row.get::<_, Vec<i16>>(0));
+                            let len = v.len();
+                            let cap = v.capacity();
+                            unsafe {
+                                Vec::from_raw_parts(v.as_mut_ptr() as *mut PPartEntry, len, cap)
                             }
-                            4 => row.get(0),
-                            _ => unreachable!(),
-                        }
+                        };
+
+                        result
                     }
                 };
 

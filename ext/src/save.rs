@@ -10,8 +10,6 @@ use algebra::Algebra;
 use anyhow::Context;
 
 #[cfg(feature = "database")]
-use algebra::milnor_algebra::PPartEntry;
-#[cfg(feature = "database")]
 use r2d2_postgres::{postgres, r2d2, PostgresConnectionManager};
 
 /// An `enum` with a variant for each method of saving data
@@ -242,11 +240,15 @@ impl SaveKind {
                 ",
             ),
             Self::NassauQi => {
-                let entry_type = match std::mem::size_of::<PPartEntry>() {
-                    2 => "SMALLINT",
-                    4 => "OID",
-                    _ => unreachable!(),
-                };
+                // Depending whether the `odd-primes` feature is enabled or not, `PPartEntry` could
+                // be `u32` or `u16`.
+                // In the latter case, we even need to cast it to an `i16` because Postgres
+                // does not have an unsigned 16 bit integer type.
+                #[cfg(feature = "odd-primes")]
+                let entry_type = "OID";
+                #[cfg(not(feature = "odd-primes"))]
+                let entry_type = "SMALLINT";
+
                 format!(
                     "
                     CREATE SCHEMA IF NOT EXISTS nassau_qi;
