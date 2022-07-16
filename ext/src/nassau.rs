@@ -14,14 +14,16 @@
 
 use std::fmt::Display;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::chain_complex::{
     AugmentedChainComplex, ChainComplex, FiniteChainComplex, FreeChainComplex,
 };
 use crate::utils::Timer;
-use crate::{save::SaveKind, utils::LogWriter};
+use crate::{
+    save::{SaveBackend, SaveBackend_, SaveKind, SaveTarget},
+    utils::LogWriter,
+};
 use algebra::combinatorics;
 use algebra::milnor_algebra::{MilnorAlgebra, PPartEntry};
 use algebra::module::homomorphism::{
@@ -39,6 +41,11 @@ use once::OnceVec;
 
 #[cfg(feature = "concurrent")]
 use std::sync::mpsc;
+
+#[cfg(feature = "database")]
+use crate::save::PostgresConnection;
+#[cfg(feature = "database")]
+use r2d2_postgres::{postgres, postgres::types::Type as PostgresType};
 
 #[cfg(feature = "concurrent")]
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
@@ -58,6 +65,39 @@ impl SenderData {
                 sender: sender.clone(),
             })
             .unwrap()
+    }
+}
+
+#[cfg(feature = "database")]
+/// Some data that we need to pass around while writing quasi-inverses into the database
+struct PostgresQiWriteHandle<'a> {
+    transaction: postgres::Transaction<'a>,
+    command_statement: postgres::Statement,
+    signature_statement: postgres::Statement,
+    lift_statement: postgres::Statement,
+    image_statement: postgres::Statement,
+    /// Buffer for byte arrays representing `FpVector`s.
+    buffer: Vec<u8>,
+}
+
+#[cfg(feature = "database")]
+/// Some data that we need to pass around while reading quasi-inverses from the database
+struct PostgresQiReadHandle {
+    connection: PostgresConnection,
+    command_rows: Vec<postgres::Row>,
+    command_index: usize,
+    signature_statement: postgres::Statement,
+    lift_statement: postgres::Statement,
+    image_statement: postgres::Statement,
+}
+
+#[cfg(feature = "database")]
+impl PostgresQiReadHandle {
+    fn current_magic(&self) -> usize {
+        self.command_rows[self.command_index].get::<_, i64>(0) as usize
+    }
+    fn current_id(&self) -> i64 {
+        self.command_rows[self.command_index].get::<_, i64>(1)
     }
 }
 
@@ -395,7 +435,7 @@ pub struct Resolution<M: ZeroModule<Algebra = MilnorAlgebra>> {
     differentials: OnceVec<Arc<FreeModuleHomomorphism<FreeModule<MilnorAlgebra>>>>,
     target: Arc<FiniteChainComplex<M>>,
     chain_maps: OnceVec<Arc<FreeModuleHomomorphism<M>>>,
-    save_dir: Option<PathBuf>,
+    save_target: Option<SaveTarget>,
 }
 
 impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
@@ -415,15 +455,26 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         Self::new_with_save(module, None).unwrap()
     }
 
-    pub fn new_with_save(module: Arc<M>, save_dir: Option<PathBuf>) -> anyhow::Result<Self> {
+    pub fn new_with_save(module: Arc<M>, save_target: Option<SaveTarget>) -> anyhow::Result<Self> {
         let max_degree = module
             .max_degree()
             .ok_or_else(|| anyhow!("Nassau's algorithm requires bounded module"))?;
         let target = Arc::new(FiniteChainComplex::ccdz(module));
 
-        if let Some(p) = &save_dir {
-            for subdir in SaveKind::nassau_data() {
-                subdir.create_dir(p)?;
+        if let Some(backend) = &save_target {
+            let mut backend = backend.get_connection_if_database();
+            match &mut backend {
+                SaveBackend::Files(p) => {
+                    for subdir in SaveKind::nassau_data() {
+                        subdir.create_dir(p)?;
+                    }
+                }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(connection) => {
+                    for kind in SaveKind::nassau_data() {
+                        kind.initialize_database(connection)?;
+                    }
+                }
             }
         }
 
@@ -436,7 +487,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             chain_maps: OnceVec::new(),
             target,
             max_degree,
-            save_dir,
+            save_target,
         })
     }
 
@@ -480,7 +531,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn write_qi(
-        f: &mut Option<impl Write>,
+        handle: Option<SaveBackend_!(&mut impl Write, &mut PostgresQiWriteHandle)>,
         s: u32,
         t: i32,
         subalgebra: &MilnorSubalgebra,
@@ -489,61 +540,218 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         next_mask: &[usize],
         full_matrix: &Matrix,
         masked_matrix: &AugmentedMatrix<2>,
-    ) -> std::io::Result<()> {
-        let f = match f {
-            Some(f) => f,
-            None => return Ok(()),
-        };
+    ) -> anyhow::Result<()> {
+        if let Some(handle) = handle {
+            let mut handle = match handle {
+                SaveBackend::Files(f) => SaveBackend::Files(LogWriter::new(f)),
+                #[cfg(feature = "database")]
+                SaveBackend::Database(handle) => {
+                    let timer = Timer::start();
+                    SaveBackend::Database((handle, timer))
+                }
+            };
 
-        let mut own_f = LogWriter::new(f);
-        let f = &mut own_f;
-
-        let pivots = &masked_matrix.pivots()[0..masked_matrix.end[0]];
-        if !pivots.iter().any(|&x| x >= 0) {
-            return Ok(());
-        }
-
-        // Write signature if non-zero.
-        if signature.iter().any(|&x| x > 0) {
-            f.write_u64::<LittleEndian>(Magic::Signature as u64)?;
-            MilnorSubalgebra::signature_to_bytes(signature, f)?;
-        }
-
-        // Write quasi-inverses
-        for (col, &row) in pivots.iter().enumerate() {
-            if row < 0 {
-                continue;
+            let pivots = &masked_matrix.pivots()[0..masked_matrix.end[0]];
+            if !pivots.iter().any(|&x| x >= 0) {
+                return Ok(());
             }
-            f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
-            let preimage = masked_matrix.row_segment(row as usize, 1, 1);
-            scratch.set_scratch_vector_size(preimage.len());
-            scratch.as_slice_mut().assign(preimage);
-            scratch.to_bytes(f)?;
 
-            scratch.set_scratch_vector_size(full_matrix.columns());
-            for (i, _) in preimage.iter_nonzero() {
-                scratch.as_slice_mut().add(full_matrix.row(i), 1);
+            // Write signature if non-zero.
+            if signature.iter().any(|&x| x > 0) {
+                match &mut handle {
+                    SaveBackend::Files(f) => {
+                        f.write_u64::<LittleEndian>(Magic::Signature as u64)?;
+                        MilnorSubalgebra::signature_to_bytes(signature, f)?;
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database((handle, _)) => {
+                        let id = handle
+                            .transaction
+                            .query_one(
+                                &handle.command_statement,
+                                &[&s, &t, &(Magic::Signature as i64)],
+                            )?
+                            .get::<_, i64>(0);
+
+                        #[cfg(feature = "odd-primes")]
+                        handle
+                            .transaction
+                            .execute(&handle.signature_statement, &[&id, &signature])?;
+                        #[cfg(not(feature = "odd-primes"))]
+                        {
+                            let transmuted = unsafe {
+                                std::slice::from_raw_parts(
+                                    signature.as_ptr() as *const i16,
+                                    signature.len(),
+                                )
+                            };
+                            handle
+                                .transaction
+                                .execute(&handle.signature_statement, &[&id, &transmuted])?;
+                        }
+                    }
+                }
             }
-            scratch.to_bytes(f)?;
-        }
 
-        own_f.finalize(format_args!(
-            "Written quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
-            n = t - s as i32,
-        ));
-        Ok(())
+            // Write quasi-inverses
+            for (col, &row) in pivots.iter().enumerate() {
+                if row < 0 {
+                    continue;
+                }
+
+                let mut handle_with_id = match &mut handle {
+                    SaveBackend::Files(f) => {
+                        f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
+                        SaveBackend::Files(f)
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database((handle, _)) => {
+                        let id = handle
+                            .transaction
+                            .query_one(
+                                &handle.command_statement,
+                                &[&s, &t, &(next_mask[col] as i64)],
+                            )?
+                            .get::<_, i64>(0);
+                        SaveBackend::Database((handle, id))
+                    }
+                };
+
+                let preimage = masked_matrix.row_segment(row as usize, 1, 1);
+                scratch.set_scratch_vector_size(preimage.len());
+                scratch.as_slice_mut().assign(preimage);
+                match &mut handle_with_id {
+                    SaveBackend::Files(f) => {
+                        scratch.to_bytes(f)?;
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database((handle, id)) => {
+                        handle.buffer.clear();
+                        scratch.to_bytes(&mut handle.buffer)?;
+                        handle
+                            .transaction
+                            .execute(&handle.lift_statement, &[id, &handle.buffer])?;
+                    }
+                }
+
+                scratch.set_scratch_vector_size(full_matrix.columns());
+                for (i, _) in preimage.iter_nonzero() {
+                    scratch.as_slice_mut().add(full_matrix.row(i), 1);
+                }
+                match handle_with_id {
+                    SaveBackend::Files(f) => {
+                        scratch.to_bytes(f)?;
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database((handle, id)) => {
+                        handle.buffer.clear();
+                        scratch.to_bytes(&mut handle.buffer)?;
+                        handle
+                            .transaction
+                            .execute(&handle.image_statement, &[&id, &handle.buffer])?;
+                    }
+                }
+            }
+
+            match handle {
+                SaveBackend::Files(f) => {
+                    f.finalize(format_args!(
+                        "Written quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
+                        n = t - s as i32,
+                    ));
+                }
+                #[cfg(feature = "database")]
+                SaveBackend::Database((_, timer)) => {
+                    timer.end(
+                        format_args!(
+                            "Inserted quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
+                            n = t - s as i32,
+                        ),
+                    );
+                }
+            }
+
+            Ok(())
+        } else {
+            Ok(())
+        }
     }
 
     fn write_differential(&self, s: u32, t: i32, num_new_gens: usize, target_dim: usize) {
-        if let Some(dir) = &self.save_dir {
-            let mut f = self
-                .save_file(SaveKind::NassauDifferential, s, t)
-                .create_file(dir.clone(), false);
-            f.write_u64::<LittleEndian>(num_new_gens as u64).unwrap();
-            f.write_u64::<LittleEndian>(target_dim as u64).unwrap();
+        if let Some(backend) = &self.save_target {
+            let backend = backend.get_connection_if_database();
+            match backend {
+                SaveBackend::Files(dir) => {
+                    let mut f = self
+                        .save_file(SaveKind::NassauDifferential, s, t)
+                        .create_file(dir.clone(), false);
+                    f.write_u64::<LittleEndian>(num_new_gens as u64).unwrap();
+                    f.write_u64::<LittleEndian>(target_dim as u64).unwrap();
 
-            for n in 0..num_new_gens {
-                self.differential(s).output(t, n).to_bytes(&mut f).unwrap();
+                    for n in 0..num_new_gens {
+                        self.differential(s).output(t, n).to_bytes(&mut f).unwrap();
+                    }
+                }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(mut connection) => {
+                    // To emulate a non-overwriting behavior, if the metadata for this differential
+                    // already exists, we just do some validity checks and return.
+                    let row = connection
+                        .query_opt(
+                            "
+                            SELECT num_gens, target_dim, s, t
+                                FROM nassau_differential.metadata WHERE s = $1 AND t = $2
+                            ",
+                            &[&s, &t],
+                        )
+                        .unwrap();
+                    if let Some(row) = row {
+                        assert_eq!(num_new_gens, row.get::<_, i64>(0) as usize);
+                        assert_eq!(target_dim, row.get::<_, i64>(1) as usize);
+                        return;
+                    }
+
+                    let mut transaction = connection.transaction().unwrap();
+
+                    transaction
+                        .execute(
+                            "
+                            INSERT INTO nassau_differential.metadata
+                                (s, t, num_gens, target_dim)
+                                VALUES ($1, $2, $3, $4)
+                            ",
+                            &[&s, &t, &(num_new_gens as i64), &(target_dim as i64)],
+                        )
+                        .unwrap();
+
+                    let mut buffer = Vec::new();
+                    let statement = transaction
+                        .prepare_typed(
+                            "
+                            INSERT INTO nassau_differential.vectors (s, t, i, bytes)
+                                VALUES ($1, $2, $3, $4)
+                            ",
+                            &[
+                                PostgresType::OID,
+                                PostgresType::INT4,
+                                PostgresType::INT8,
+                                PostgresType::BYTEA,
+                            ],
+                        )
+                        .unwrap();
+                    for n in 0..num_new_gens {
+                        buffer.clear();
+                        self.differential(s)
+                            .output(t, n)
+                            .to_bytes(&mut buffer)
+                            .unwrap();
+                        transaction
+                            .execute(&statement, &[&s, &t, &(n as i64), &buffer])
+                            .unwrap();
+                    }
+
+                    transaction.commit().unwrap();
+                }
             }
         }
     }
@@ -578,19 +786,90 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let next = &self.modules[s - 2];
         next.compute_basis(t);
 
-        let mut f = if let Some(dir) = self.save_dir() {
-            let mut f = self
-                .save_file(SaveKind::NassauQi, s - 1, t)
-                .create_file(dir.to_owned(), true);
-            f.write_u64::<LittleEndian>(next.dimension(t) as u64)
-                .unwrap();
-            f.write_u64::<LittleEndian>(target_masked_dim as u64)
-                .unwrap();
-            subalgebra.to_bytes(&mut f).unwrap();
-            Some(f)
-        } else {
-            None
-        };
+        let mut save_target = self
+            .save_target
+            .as_ref()
+            .map(|backend| backend.get_connection_if_database());
+        let mut handle = save_target.as_mut().map(|backend| {
+            match backend {
+                SaveBackend::Files(dir) => {
+                    let mut f = self
+                        .save_file(SaveKind::NassauQi, s - 1, t)
+                        .create_file(dir.to_owned(), true);
+                    f.write_u64::<LittleEndian>(next.dimension(t) as u64)
+                        .unwrap();
+                    f.write_u64::<LittleEndian>(target_masked_dim as u64)
+                        .unwrap();
+                    subalgebra.to_bytes(&mut f).unwrap();
+                    SaveBackend::Files(f)
+                }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(connection) => {
+                    // We delete existing data for this bidegree to emulate the
+                    // overwriting behavior.
+                    // Deleting the metadata is sufficient because the rest will
+                    // be cleaned up by the `CASCADE` mechanism.
+                    connection
+                        .execute(
+                            "DELETE FROM nassau_qi.metadata WHERE s = $1 AND t = $2",
+                            &[&s, &t],
+                        )
+                        .unwrap();
+
+                    let mut transaction = connection.transaction().unwrap();
+
+                    transaction
+                        .execute(
+                            "
+                            INSERT INTO nassau_qi.metadata(
+                                s, t, target_dim, target_masked_dim, subalgebra_profile
+                            ) VALUES ($1, $2, $3, $4, $5)
+                            ",
+                            &[
+                                &s,
+                                &t,
+                                &(next.dimension(t) as i64),
+                                &(target_masked_dim as i64),
+                                &subalgebra.profile,
+                            ],
+                        )
+                        .unwrap();
+
+                    let command_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.commands(s, t, magic) VALUES ($1, $2, $3) RETURNING id",
+                        &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
+                    ).unwrap();
+                    let entries_type = match std::mem::size_of::<PPartEntry>() {
+                        2 => PostgresType::INT2_ARRAY,
+                        4 => PostgresType::OID_ARRAY,
+                        _ => unreachable!(),
+                    };
+                    let signature_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.signatures(command_id, entries) VALUES ($1, $2)",
+                        &[PostgresType::INT8, entries_type],
+                    ).unwrap();
+                    let lift_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.lifts(command_id, bytes) VALUES ($1, $2)",
+                        &[PostgresType::INT8, PostgresType::BYTEA],
+                    ).unwrap();
+                    let image_statement = transaction.prepare_typed(
+                        "INSERT INTO nassau_qi.images(command_id, bytes) VALUES ($1, $2)",
+                        &[PostgresType::INT8, PostgresType::BYTEA],
+                    ).unwrap();
+
+                    let buffer: Vec<u8> = Vec::new();
+
+                    SaveBackend::Database(PostgresQiWriteHandle {
+                        transaction,
+                        signature_statement,
+                        command_statement,
+                        lift_statement,
+                        image_statement,
+                        buffer,
+                    })
+                }
+            }
+        });
 
         let next_mask: Vec<usize> = subalgebra
             .signature_mask(&algebra, &self.modules[s - 2], t, &zero_sig)
@@ -609,7 +888,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let kernel = masked_matrix.compute_kernel();
 
         Self::write_qi(
-            &mut f,
+            handle.as_mut().map(|b| b.as_mut()),
             s,
             t,
             &subalgebra,
@@ -621,9 +900,20 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         )
         .unwrap();
 
-        if let Some(f) = &mut f {
+        if let Some(handle) = &mut handle {
             if target.max_computed_degree() < t {
-                f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
+                match handle {
+                    SaveBackend::Files(f) => {
+                        f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(handle) => {
+                        handle
+                            .transaction
+                            .execute(&handle.command_statement, &[&s, &t, &(Magic::Fix as i64)])
+                            .unwrap();
+                    }
+                }
             }
         }
 
@@ -693,7 +983,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
             Self::write_qi(
-                &mut f,
+                handle.as_mut().map(|b| b.as_mut()),
                 s,
                 t,
                 &subalgebra,
@@ -712,8 +1002,20 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
 
         end();
 
-        if let Some(f) = &mut f {
-            f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
+        if let Some(handle) = handle {
+            match handle {
+                SaveBackend::Files(mut f) => {
+                    f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
+                }
+                #[cfg(feature = "database")]
+                SaveBackend::Database(mut handle) => {
+                    handle
+                        .transaction
+                        .execute(&handle.command_statement, &[&s, &t, &(Magic::End as i64)])
+                        .unwrap();
+                    handle.transaction.commit().unwrap();
+                }
+            }
         }
 
         self.write_differential(s, t, num_new_gens, target_dim);
@@ -835,25 +1137,83 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             return self.step0(t);
         }
 
-        if let Some(dir) = &self.save_dir {
-            if let Some(mut f) = self
-                .save_file(SaveKind::NassauDifferential, s, t)
-                .open_file(dir.clone())
-            {
-                let num_new_gens = f.read_u64::<LittleEndian>().unwrap() as usize;
-                // This need not be equal to `target_res_dimension`. If we saved a big resolution
-                // and now only want to load up to a small stem, then `target_res_dimension` will
-                // be smaller. If we have previously saved a small resolution up to a stem and now
-                // want to resolve further, it will be bigger.
-                let saved_target_res_dimension = f.read_u64::<LittleEndian>().unwrap() as usize;
+        if let Some(backend) = &self.save_target {
+            let mut backend = backend.get_connection_if_database();
 
+            let initialization = match &mut backend {
+                SaveBackend::Files(dir) => self
+                    .save_file(SaveKind::NassauDifferential, s, t)
+                    .open_file(dir.clone())
+                    .map(|mut f| {
+                        let num = f.read_u64::<LittleEndian>().unwrap() as usize;
+                        let dim = f.read_u64::<LittleEndian>().unwrap() as usize;
+                        (SaveBackend::Files(f), num, dim)
+                    }),
+                #[cfg(feature = "database")]
+                SaveBackend::Database(connection) => {
+                    let mut transaction = connection
+                        .build_transaction()
+                        .read_only(true)
+                        .isolation_level(postgres::IsolationLevel::Serializable)
+                        .start()
+                        .unwrap();
+                    transaction
+                        .query_one(
+                            "
+                            SELECT num_gens, target_dim, s, t
+                                FROM nassau_differential.metadata WHERE s = $1 AND t = $2
+                            ",
+                            &[&s, &t],
+                        )
+                        .ok()
+                        .map(|row| {
+                            (
+                                SaveBackend::Database(transaction),
+                                row.get::<_, i64>(0) as usize,
+                                row.get::<_, i64>(1) as usize,
+                            )
+                        })
+                }
+            };
+
+            // `saved_target_res_dimension` need not be equal to `target_res_dimension`. If we
+            // saved a big resolution and now only want to load up to a small stem, then
+            // `target_res_dimension` will be smaller. If we have previously saved a small
+            // resolution up to a stem and now want to resolve further, it will be bigger.
+            if let Some((handle, num_new_gens, saved_target_res_dimension)) = initialization {
                 self.modules[s].add_generators(t, num_new_gens, None);
-
                 let mut d_targets = Vec::with_capacity(num_new_gens);
 
-                for _ in 0..num_new_gens {
-                    d_targets
-                        .push(FpVector::from_bytes(p, saved_target_res_dimension, &mut f).unwrap());
+                match handle {
+                    SaveBackend::Files(mut f) => {
+                        for _ in 0..num_new_gens {
+                            d_targets.push(
+                                FpVector::from_bytes(p, saved_target_res_dimension, &mut f)
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(mut transaction) => {
+                        let rows = transaction
+                            .query(
+                                "
+                                SELECT bytes, s, t, i FROM nassau_differential.vectors
+                                    WHERE s = $1 AND t = $2 ORDER BY i ASC
+                                ",
+                                &[&s, &t],
+                            )
+                            .unwrap();
+                        d_targets.extend(rows.iter().map(|v| {
+                            FpVector::from_bytes(
+                                p,
+                                saved_target_res_dimension,
+                                &mut v.get::<_, Vec<u8>>(0).as_slice(),
+                            )
+                            .unwrap()
+                        }));
+                        transaction.commit().unwrap();
+                    }
                 }
 
                 self.differentials[s].add_generators_from_rows(t, d_targets);
@@ -999,7 +1359,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
     }
 
     fn save_dir(&self) -> Option<&std::path::Path> {
-        self.save_dir.as_deref()
+        self.save_target.as_ref().and_then(|backend| match backend {
+            SaveBackend::Files(dir) => Some(dir.as_ref()),
+            #[cfg(feature = "database")]
+            _ => None,
+        })
     }
 
     fn apply_quasi_inverse<T, S>(&self, results: &mut [T], s: u32, t: i32, inputs: &[S]) -> bool
@@ -1007,24 +1371,101 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         for<'a> &'a mut T: Into<SliceMut<'a>>,
         for<'a> &'a S: Into<Slice<'a>>,
     {
-        let mut f = if let Some(dir) = &self.save_dir {
-            if let Some(f) = self
-                .save_file(SaveKind::NassauQi, s, t)
-                .open_file(dir.clone())
-            {
-                f
+        let (target_dim, zero_mask_dim, subalgebra, mut handle) =
+            if let Some(backend) = &self.save_target {
+                let backend = backend.get_connection_if_database();
+                match backend {
+                    SaveBackend::Files(dir) => {
+                        if let Some(mut f) = self
+                            .save_file(SaveKind::NassauQi, s, t)
+                            .open_file(dir.clone())
+                        {
+                            let target_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
+                            let zero_mask_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
+                            let subalgebra = MilnorSubalgebra::from_bytes(&mut f).unwrap();
+                            (target_dim, zero_mask_dim, subalgebra, SaveBackend::Files(f))
+                        } else {
+                            return false;
+                        }
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(mut connection) => {
+                        let mut transaction = connection
+                            .build_transaction()
+                            .read_only(true)
+                            .isolation_level(postgres::IsolationLevel::Serializable)
+                            .start()
+                            .unwrap();
+                        let row = transaction
+                            .query_opt(
+                                "
+                                SELECT target_dim, target_dim, subalgebra_profile
+                                    FROM nassau_qi.metadata WHERE s = $1 AND t = $2
+                                ",
+                                &[&s, &t],
+                            )
+                            .unwrap();
+                        if let Some(row) = row {
+                            let target_dim = row.get::<_, i64>(0) as usize;
+                            let zero_mask_dim = row.get::<_, i64>(1) as usize;
+                            let subalgebra = MilnorSubalgebra::new(row.get(2));
+
+                            let command_rows = transaction
+                                .query(
+                                    "
+                                    SELECT magic, id FROM nassau_qi.commands
+                                        WHERE s = $1 AND t = $2 ORDER BY id ASC
+                                    ",
+                                    &[&s, &t],
+                                )
+                                .unwrap();
+                            // If we were pedantic, we could continue using the transaction while
+                            // while reading command data, but as each command has a unique `id`,
+                            // the worst that can happen is a `query_one` failing.
+                            transaction.commit().unwrap();
+                            let command_index = 0;
+
+                            let signature_statement = connection.prepare_typed(
+                                "SELECT entries FROM nassau_qi.signatures WHERE command_id = $1",
+                                &[PostgresType::INT8],
+                            ).unwrap();
+                            let lift_statement = connection
+                                .prepare_typed(
+                                    "SELECT bytes FROM nassau_qi.lifts WHERE command_id = $1",
+                                    &[PostgresType::INT8],
+                                )
+                                .unwrap();
+                            let image_statement = connection
+                                .prepare_typed(
+                                    "SELECT bytes FROM nassau_qi.images WHERE command_id = $1",
+                                    &[PostgresType::INT8],
+                                )
+                                .unwrap();
+
+                            (
+                                target_dim,
+                                zero_mask_dim,
+                                subalgebra,
+                                SaveBackend::Database(PostgresQiReadHandle {
+                                    connection,
+                                    signature_statement,
+                                    lift_statement,
+                                    image_statement,
+                                    command_rows,
+                                    command_index,
+                                }),
+                            )
+                        } else {
+                            return false;
+                        }
+                    }
+                }
             } else {
                 return false;
-            }
-        } else {
-            return false;
-        };
+            };
 
         let p = self.prime();
 
-        let target_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
-        let zero_mask_dim = f.read_u64::<LittleEndian>().unwrap() as usize;
-        let subalgebra = MilnorSubalgebra::from_bytes(&mut f).unwrap();
         let source = &self.modules[s];
         let target = &self.modules[s - 1];
         let algebra = target.algebra();
@@ -1084,11 +1525,39 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
         };
 
         loop {
-            let col = f.read_u64::<LittleEndian>().unwrap() as usize;
+            let col = match &mut handle {
+                SaveBackend::Files(f) => f.read_u64::<LittleEndian>().unwrap() as usize,
+                #[cfg(feature = "database")]
+                SaveBackend::Database(handle) => handle.current_magic(),
+            };
             if col == Magic::End as usize {
                 break;
             } else if col == Magic::Signature as usize {
-                let signature = subalgebra.signature_from_bytes(&mut f).unwrap();
+                let signature = match &mut handle {
+                    SaveBackend::Files(f) => subalgebra.signature_from_bytes(f).unwrap(),
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(handle) => {
+                        let id = handle.current_id();
+                        let row = handle
+                            .connection
+                            .query_one(&handle.signature_statement, &[&id])
+                            .unwrap();
+
+                        #[cfg(feature = "odd-primes")]
+                        let result = row.get(0);
+                        #[cfg(not(feature = "odd-primes"))]
+                        let result = {
+                            let mut v = std::mem::ManuallyDrop::new(row.get::<_, Vec<i16>>(0));
+                            let len = v.len();
+                            let cap = v.capacity();
+                            unsafe {
+                                Vec::from_raw_parts(v.as_mut_ptr() as *mut PPartEntry, len, cap)
+                            }
+                        };
+
+                        result
+                    }
+                };
 
                 mask.clear();
                 mask.extend(subalgebra.signature_mask(&algebra, source, t, &signature));
@@ -1128,8 +1597,30 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                 target_zero_mask = Vec::new();
                 dx_matrix = AugmentedMatrix::<3>::new(p, 0, [0, 0, 0]);
             } else {
-                scratch0.update_from_bytes(&mut f).unwrap();
-                scratch1.update_from_bytes(&mut f).unwrap();
+                match &mut handle {
+                    SaveBackend::Files(f) => {
+                        scratch0.update_from_bytes(f).unwrap();
+                        scratch1.update_from_bytes(f).unwrap();
+                    }
+                    #[cfg(feature = "database")]
+                    SaveBackend::Database(handle) => {
+                        let id = handle.current_id();
+                        let row = handle
+                            .connection
+                            .query_one(&handle.lift_statement, &[&id])
+                            .unwrap();
+                        scratch0
+                            .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])
+                            .unwrap();
+                        let row = handle
+                            .connection
+                            .query_one(&handle.image_statement, &[&id])
+                            .unwrap();
+                        scratch1
+                            .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])
+                            .unwrap();
+                    }
+                }
                 for (input, output) in inputs.iter_mut().zip(results.iter_mut()) {
                     let entry = input.entry(col);
                     if entry != 0 {
@@ -1157,9 +1648,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     }
                 }
             }
+
+            #[cfg(feature = "database")]
+            if let SaveBackend::Database(handle) = &mut handle {
+                handle.command_index += 1;
+            }
         }
+
         // Make sure we have finished reading everything
-        drop(f);
+        match handle {
+            SaveBackend::Files(f) => drop(f),
+            #[cfg(feature = "database")]
+            SaveBackend::Database(handle) => {
+                assert_eq!(handle.command_rows.len() - 1, handle.command_index)
+            }
+        }
 
         for dx in inputs {
             assert!(

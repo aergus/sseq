@@ -4,6 +4,7 @@ use crate::chain_complex::{
 };
 
 use crate::resolution::{Resolution, UnstableResolution};
+use crate::save::SaveTarget;
 use crate::CCC;
 use algebra::module::{steenrod_module, FDModule, Module, SteenrodModule};
 use algebra::{AlgebraType, MilnorAlgebra, SteenrodAlgebra};
@@ -144,7 +145,7 @@ where
 {
     #[cfg(feature = "nassau")]
     {
-        construct_nassau(module_spec, save_dir)
+        construct_nassau(module_spec, save_dir.map(SaveTarget::from))
     }
 
     #[cfg(not(feature = "nassau"))]
@@ -156,7 +157,7 @@ where
 /// See [`construct`]
 pub fn construct_nassau<T, E>(
     module_spec: T,
-    save_dir: Option<PathBuf>,
+    save_dir: Option<SaveTarget>,
 ) -> anyhow::Result<crate::nassau::Resolution<FDModule<MilnorAlgebra>>>
 where
     anyhow::Error: From<E>,
@@ -448,7 +449,7 @@ pub fn get_unit(
         {
             Arc::new(crate::nassau::Resolution::new_with_save(
                 Arc::new(module),
-                save_dir,
+                save_dir.map(SaveTarget::from),
             )?)
         }
 

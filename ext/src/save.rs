@@ -1,5 +1,6 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashSet;
+use std::convert::From;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
@@ -7,6 +8,81 @@ use std::sync::{Arc, Mutex};
 
 use algebra::Algebra;
 use anyhow::Context;
+
+#[cfg(feature = "database")]
+use r2d2_postgres::{postgres, r2d2, PostgresConnectionManager};
+
+/// An `enum` with a variant for each method of saving data
+pub enum SaveBackend<F, #[cfg(feature = "database")] D> {
+    /// Use files in a directory
+    Files(F),
+    #[cfg(feature = "database")]
+    /// Use a (Postgres) database
+    Database(D),
+}
+
+// While declaring a different number of generic parameters based on a `cfg` directive is possible
+// (cf. how the parameter `D` is handled in the enum `SaveBackend`), *instantiating* a different
+// number of generic parameters based on a `cfg` directive doesn't seem to be possible (as of Rust
+// 1.62.0), i.e., `SaveBackend<F, #[cfg(feature = "database")] D>` is not accepted in `impl` block
+// headers and function arguments.
+// We therefore use macros that insert the correct instantiation based on which features are
+// enabled.
+
+#[cfg(not(feature = "database"))]
+macro_rules! SaveBackend_ {($f:ty, $_:ty) => {SaveBackend<$f>}}
+#[cfg(feature = "database")]
+macro_rules! SaveBackend_ {($f:ty, $d:ty) => {SaveBackend<$f, $d>}}
+
+pub(crate) use SaveBackend_;
+
+impl<F, #[cfg(feature = "database")] D> SaveBackend_!(F, D) {
+    pub fn as_ref(&self) -> SaveBackend_!(&F, &D) {
+        match self {
+            Self::Files(fs) => SaveBackend::Files(fs),
+            #[cfg(feature = "database")]
+            Self::Database(db) => SaveBackend::Database(db),
+        }
+    }
+    pub fn as_mut(&mut self) -> SaveBackend_!(&mut F, &mut D) {
+        match self {
+            Self::Files(fs) => SaveBackend::Files(fs),
+            #[cfg(feature = "database")]
+            Self::Database(db) => SaveBackend::Database(db),
+        }
+    }
+}
+
+#[cfg(feature = "database")]
+pub type PostgresPool = r2d2::Pool<PostgresConnectionManager<postgres::NoTls>>;
+#[cfg(feature = "database")]
+pub type PostgresConnection = r2d2::PooledConnection<PostgresConnectionManager<postgres::NoTls>>;
+
+/// A specialized version of [SaveBackend] that is used to describe where data should be written
+pub type SaveTarget = SaveBackend_!(PathBuf, PostgresPool);
+
+impl From<PathBuf> for SaveTarget {
+    fn from(p: PathBuf) -> Self {
+        SaveBackend::Files(p)
+    }
+}
+
+impl<F> SaveBackend_!(F, PostgresPool) {
+    /// When the `database` feature is enabled, this function `get`s a connection from the pool
+    /// in the [SaveBackend::Database] variant, and for other variants, it behaves like
+    /// [SaveBackend::as_ref].
+    ///
+    /// We use this to obtain connections instead of calling [PostgresPool::get] in an appropriate
+    /// `match` arm because we cannot move a transaction out of the block in which its parent
+    /// connection was created.
+    pub fn get_connection_if_database(&self) -> SaveBackend_!(&F, PostgresConnection) {
+        match self {
+            Self::Files(x) => SaveBackend::Files(x),
+            #[cfg(feature = "database")]
+            Self::Database(pool) => SaveBackend::Database(pool.get().unwrap()),
+        }
+    }
+}
 
 /// A DashSet<PathBuf>> of files that are currently opened and being written to. When calling this
 /// function for the first time, we set the ctrlc handler to delete currently opened files, then
@@ -136,6 +212,83 @@ impl SaveKind {
             return Err(anyhow::anyhow!("{p:?} is not a directory"));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "database")]
+    pub fn initialize_database(self, conn: &mut postgres::Client) -> Result<(), postgres::Error> {
+        // Taking a detour through `String` because we have to format things...
+        let query = match self {
+            Self::NassauDifferential => String::from(
+                "
+                CREATE SCHEMA IF NOT EXISTS nassau_differential;
+                CREATE TABLE IF NOT EXISTS nassau_differential.metadata (
+                    s OID NOT NULL,
+                    t INT NOT NULL,
+                    num_gens BIGINT NOT NULL,
+                    target_dim BIGINT NOT NULL,
+                    PRIMARY KEY(s, t)
+                );
+                CREATE TABLE IF NOT EXISTS nassau_differential.vectors (
+                    s OID NOT NULL,
+                    t INT NOT NULL,
+                    i BIGINT NOT NULL,
+                    bytes BYTEA NOT NULL,
+                    PRIMARY KEY (s, t, i),
+                    FOREIGN KEY (s, t)
+                        REFERENCES nassau_differential.metadata(s,t) ON DELETE CASCADE
+                )
+                ",
+            ),
+            Self::NassauQi => {
+                // Depending whether the `odd-primes` feature is enabled or not, `PPartEntry` could
+                // be `u32` or `u16`.
+                // In the latter case, we even need to cast it to an `i16` because Postgres
+                // does not have an unsigned 16 bit integer type.
+                #[cfg(feature = "odd-primes")]
+                let entry_type = "OID";
+                #[cfg(not(feature = "odd-primes"))]
+                let entry_type = "SMALLINT";
+
+                format!(
+                    "
+                    CREATE SCHEMA IF NOT EXISTS nassau_qi;
+                    CREATE TABLE IF NOT EXISTS nassau_qi.metadata (
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        target_dim BIGINT NOT NULL,
+                        target_masked_dim BIGINT NOT NULL,
+                        subalgebra_profile BYTEA NOT NULL,
+                        PRIMARY KEY (s, t)
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.commands (
+                        id BIGSERIAL PRIMARY KEY NOT NULL,
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        magic BIGINT NOT NULL,
+                        FOREIGN KEY (s, t)
+                            REFERENCES nassau_qi.metadata(s,t) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.signatures (
+                        command_id BIGSERIAL NOT NULL
+                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
+                        entries {entry_type}[] NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.lifts (
+                        command_id BIGSERIAL NOT NULL
+                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
+                        bytes BYTEA NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS nassau_qi.images (
+                        command_id BIGSERIAL NOT NULL
+                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
+                        bytes BYTEA
+                    );
+                    "
+                )
+            }
+            _ => todo!(),
+        };
+        conn.batch_execute(&query)
     }
 }
 
