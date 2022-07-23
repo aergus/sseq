@@ -261,27 +261,40 @@ impl SaveKind {
                         PRIMARY KEY (s, t)
                     );
                     CREATE TABLE IF NOT EXISTS nassau_qi.commands (
-                        id BIGSERIAL PRIMARY KEY NOT NULL,
                         s OID NOT NULL,
                         t INT NOT NULL,
+                        i BIGINT NOT NULL,
                         magic BIGINT NOT NULL,
+                        PRIMARY KEY (s, t, i),
                         FOREIGN KEY (s, t)
                             REFERENCES nassau_qi.metadata(s,t) ON DELETE CASCADE
                     );
                     CREATE TABLE IF NOT EXISTS nassau_qi.signatures (
-                        command_id BIGSERIAL NOT NULL
-                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
-                        entries {entry_type}[] NOT NULL
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        i BIGINT NOT NULL,
+                        entries {entry_type}[] NOT NULL,
+                        PRIMARY KEY (s, t, i),
+                        FOREIGN KEY (s, t, i)
+                            REFERENCES nassau_qi.commands(s, t, i) ON DELETE CASCADE
                     );
                     CREATE TABLE IF NOT EXISTS nassau_qi.lifts (
-                        command_id BIGSERIAL NOT NULL
-                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
-                        bytes BYTEA NOT NULL
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        i BIGINT NOT NULL,
+                        bytes BYTEA NOT NULL,
+                        PRIMARY KEY (s, t, i),
+                        FOREIGN KEY (s, t, i)
+                            REFERENCES nassau_qi.commands(s, t, i) ON DELETE CASCADE
                     );
                     CREATE TABLE IF NOT EXISTS nassau_qi.images (
-                        command_id BIGSERIAL NOT NULL
-                            PRIMARY KEY REFERENCES nassau_qi.commands(id) ON DELETE CASCADE,
-                        bytes BYTEA
+                        s OID NOT NULL,
+                        t INT NOT NULL,
+                        i BIGINT NOT NULL,
+                        bytes BYTEA NOT NULL,
+                        PRIMARY KEY (s, t, i),
+                        FOREIGN KEY (s, t, i)
+                            REFERENCES nassau_qi.commands(s, t, i) ON DELETE CASCADE
                     );
                     "
                 )

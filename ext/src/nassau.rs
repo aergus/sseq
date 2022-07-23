@@ -71,6 +71,7 @@ impl SenderData {
 #[cfg(feature = "database")]
 /// Some data that we need to pass around while writing quasi-inverses into the database
 struct PostgresQiWriteHandle<'a> {
+    command_index: usize,
     transaction: postgres::Transaction<'a>,
     command_statement: postgres::Statement,
     signature_statement: postgres::Statement,
@@ -95,9 +96,6 @@ struct PostgresQiReadHandle {
 impl PostgresQiReadHandle {
     fn current_magic(&self) -> usize {
         self.command_rows[self.command_index].get::<_, i64>(0) as usize
-    }
-    fn current_id(&self) -> i64 {
-        self.command_rows[self.command_index].get::<_, i64>(1)
     }
 }
 
@@ -565,18 +563,21 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database((handle, _)) => {
-                        let id = handle
-                            .transaction
-                            .query_one(
-                                &handle.command_statement,
-                                &[&s, &t, &(Magic::Signature as i64)],
-                            )?
-                            .get::<_, i64>(0);
+                        handle.transaction.execute(
+                            &handle.command_statement,
+                            &[
+                                &s,
+                                &t,
+                                &(handle.command_index as i64),
+                                &(Magic::Signature as i64),
+                            ],
+                        )?;
 
                         #[cfg(feature = "odd-primes")]
-                        handle
-                            .transaction
-                            .execute(&handle.signature_statement, &[&id, &signature])?;
+                        handle.transaction.execute(
+                            &handle.signature_statement,
+                            &[&s, &t, &(handle.command_index as i64), &signature],
+                        )?;
                         #[cfg(not(feature = "odd-primes"))]
                         {
                             let transmuted = unsafe {
@@ -585,10 +586,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     signature.len(),
                                 )
                             };
-                            handle
-                                .transaction
-                                .execute(&handle.signature_statement, &[&id, &transmuted])?;
+                            handle.transaction.execute(
+                                &handle.signature_statement,
+                                &[&s, &t, &(handle.command_index as i64), &transmuted],
+                            )?;
                         }
+
+                        handle.command_index += 1;
                     }
                 }
             }
@@ -599,38 +603,39 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     continue;
                 }
 
-                let mut handle_with_id = match &mut handle {
+                match &mut handle {
                     SaveBackend::Files(f) => {
                         f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
-                        SaveBackend::Files(f)
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database((handle, _)) => {
-                        let id = handle
-                            .transaction
-                            .query_one(
-                                &handle.command_statement,
-                                &[&s, &t, &(next_mask[col] as i64)],
-                            )?
-                            .get::<_, i64>(0);
-                        SaveBackend::Database((handle, id))
+                        handle.transaction.execute(
+                            &handle.command_statement,
+                            &[
+                                &s,
+                                &t,
+                                &(handle.command_index as i64),
+                                &(next_mask[col] as i64),
+                            ],
+                        )?;
                     }
                 };
 
                 let preimage = masked_matrix.row_segment(row as usize, 1, 1);
                 scratch.set_scratch_vector_size(preimage.len());
                 scratch.as_slice_mut().assign(preimage);
-                match &mut handle_with_id {
+                match &mut handle {
                     SaveBackend::Files(f) => {
                         scratch.to_bytes(f)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database((handle, id)) => {
+                    SaveBackend::Database((handle, _)) => {
                         handle.buffer.clear();
                         scratch.to_bytes(&mut handle.buffer)?;
-                        handle
-                            .transaction
-                            .execute(&handle.lift_statement, &[id, &handle.buffer])?;
+                        handle.transaction.execute(
+                            &handle.lift_statement,
+                            &[&s, &t, &(handle.command_index as i64), &handle.buffer],
+                        )?;
                     }
                 }
 
@@ -638,17 +643,19 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 for (i, _) in preimage.iter_nonzero() {
                     scratch.as_slice_mut().add(full_matrix.row(i), 1);
                 }
-                match handle_with_id {
+                match &mut handle {
                     SaveBackend::Files(f) => {
                         scratch.to_bytes(f)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database((handle, id)) => {
+                    SaveBackend::Database((handle, _)) => {
                         handle.buffer.clear();
                         scratch.to_bytes(&mut handle.buffer)?;
-                        handle
-                            .transaction
-                            .execute(&handle.image_statement, &[&id, &handle.buffer])?;
+                        handle.transaction.execute(
+                            &handle.image_statement,
+                            &[&s, &t, &(handle.command_index as i64), &handle.buffer],
+                        )?;
+                        handle.command_index += 1;
                     }
                 }
             }
@@ -835,28 +842,68 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         )
                         .unwrap();
 
-                    let command_statement = transaction.prepare_typed(
-                        "INSERT INTO nassau_qi.commands(s, t, magic) VALUES ($1, $2, $3) RETURNING id",
-                        &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
-                    ).unwrap();
+                    let command_statement = transaction
+                        .prepare_typed(
+                            "
+                                INSERT INTO nassau_qi.commands(s, t, i, magic)
+                                    VALUES ($1, $2, $3, $4)
+                                ",
+                            &[
+                                PostgresType::OID,
+                                PostgresType::INT4,
+                                PostgresType::INT8,
+                                PostgresType::INT8,
+                            ],
+                        )
+                        .unwrap();
                     let entries_type = match std::mem::size_of::<PPartEntry>() {
                         2 => PostgresType::INT2_ARRAY,
                         4 => PostgresType::OID_ARRAY,
                         _ => unreachable!(),
                     };
-                    let signature_statement = transaction.prepare_typed(
-                        "INSERT INTO nassau_qi.signatures(command_id, entries) VALUES ($1, $2)",
-                        &[PostgresType::INT8, entries_type],
-                    ).unwrap();
-                    let lift_statement = transaction.prepare_typed(
-                        "INSERT INTO nassau_qi.lifts(command_id, bytes) VALUES ($1, $2)",
-                        &[PostgresType::INT8, PostgresType::BYTEA],
-                    ).unwrap();
-                    let image_statement = transaction.prepare_typed(
-                        "INSERT INTO nassau_qi.images(command_id, bytes) VALUES ($1, $2)",
-                        &[PostgresType::INT8, PostgresType::BYTEA],
-                    ).unwrap();
+                    let signature_statement = transaction
+                        .prepare_typed(
+                            "
+                            INSERT INTO nassau_qi.signatures(s, t, i, entries)
+                                VALUES ($1, $2, $3, $4)
+                            ",
+                            &[
+                                PostgresType::OID,
+                                PostgresType::INT4,
+                                PostgresType::INT8,
+                                entries_type,
+                            ],
+                        )
+                        .unwrap();
+                    let lift_statement = transaction
+                        .prepare_typed(
+                            "
+                            INSERT INTO nassau_qi.lifts(s, t, i, bytes)
+                                VALUES ($1, $2, $3, $4)
+                            ",
+                            &[
+                                PostgresType::OID,
+                                PostgresType::INT4,
+                                PostgresType::INT8,
+                                PostgresType::BYTEA,
+                            ],
+                        )
+                        .unwrap();
+                    let image_statement = transaction
+                        .prepare_typed(
+                            "INSERT INTO nassau_qi.images(s, t, i, bytes)
+                                VALUES ($1, $2, $3, $4)
+                            ",
+                            &[
+                                PostgresType::OID,
+                                PostgresType::INT4,
+                                PostgresType::INT8,
+                                PostgresType::BYTEA,
+                            ],
+                        )
+                        .unwrap();
 
+                    let command_index = 0;
                     let buffer: Vec<u8> = Vec::new();
 
                     SaveBackend::Database(PostgresQiWriteHandle {
@@ -865,6 +912,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         command_statement,
                         lift_statement,
                         image_statement,
+                        command_index,
                         buffer,
                     })
                 }
@@ -910,8 +958,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     SaveBackend::Database(handle) => {
                         handle
                             .transaction
-                            .execute(&handle.command_statement, &[&s, &t, &(Magic::Fix as i64)])
+                            .execute(
+                                &handle.command_statement,
+                                &[&s, &t, &(handle.command_index as i64), &(Magic::Fix as i64)],
+                            )
                             .unwrap();
+                        handle.command_index += 1;
                     }
                 }
             }
@@ -1011,7 +1063,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 SaveBackend::Database(mut handle) => {
                     handle
                         .transaction
-                        .execute(&handle.command_statement, &[&s, &t, &(Magic::End as i64)])
+                        .execute(
+                            &handle.command_statement,
+                            &[&s, &t, &(handle.command_index as i64), &(Magic::End as i64)],
+                        )
                         .unwrap();
                     handle.transaction.commit().unwrap();
                 }
@@ -1413,8 +1468,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             let command_rows = transaction
                                 .query(
                                     "
-                                    SELECT magic, id FROM nassau_qi.commands
-                                        WHERE s = $1 AND t = $2 ORDER BY id ASC
+                                    SELECT magic FROM nassau_qi.commands
+                                        WHERE s = $1 AND t = $2 ORDER BY i ASC
                                     ",
                                     &[&s, &t],
                                 )
@@ -1425,20 +1480,31 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                             transaction.commit().unwrap();
                             let command_index = 0;
 
-                            let signature_statement = connection.prepare_typed(
-                                "SELECT entries FROM nassau_qi.signatures WHERE command_id = $1",
-                                &[PostgresType::INT8],
-                            ).unwrap();
+                            let signature_statement = connection
+                                .prepare_typed(
+                                    "
+                                    SELECT entries FROM nassau_qi.signatures
+                                        WHERE s = $1 AND t = $2 AND i = $3
+                                    ",
+                                    &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
+                                )
+                                .unwrap();
                             let lift_statement = connection
                                 .prepare_typed(
-                                    "SELECT bytes FROM nassau_qi.lifts WHERE command_id = $1",
-                                    &[PostgresType::INT8],
+                                    "
+                                    SELECT bytes FROM nassau_qi.lifts
+                                        WHERE s = $1 AND t = $2 AND i = $3
+                                    ",
+                                    &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
                                 )
                                 .unwrap();
                             let image_statement = connection
                                 .prepare_typed(
-                                    "SELECT bytes FROM nassau_qi.images WHERE command_id = $1",
-                                    &[PostgresType::INT8],
+                                    "
+                                    SELECT bytes FROM nassau_qi.images WHERE command_id = $1
+                                        WHERE s = $1 AND t = $2 AND i = $3
+                                    ",
+                                    &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
                                 )
                                 .unwrap();
 
@@ -1537,10 +1603,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     SaveBackend::Files(f) => subalgebra.signature_from_bytes(f).unwrap(),
                     #[cfg(feature = "database")]
                     SaveBackend::Database(handle) => {
-                        let id = handle.current_id();
                         let row = handle
                             .connection
-                            .query_one(&handle.signature_statement, &[&id])
+                            .query_one(
+                                &handle.signature_statement,
+                                &[&s, &t, &(handle.command_index as i64)],
+                            )
                             .unwrap();
 
                         #[cfg(feature = "odd-primes")]
@@ -1604,17 +1672,22 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database(handle) => {
-                        let id = handle.current_id();
                         let row = handle
                             .connection
-                            .query_one(&handle.lift_statement, &[&id])
+                            .query_one(
+                                &handle.lift_statement,
+                                &[&s, &t, &(handle.command_index as i64)],
+                            )
                             .unwrap();
                         scratch0
                             .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])
                             .unwrap();
                         let row = handle
                             .connection
-                            .query_one(&handle.image_statement, &[&id])
+                            .query_one(
+                                &handle.image_statement,
+                                &[&s, &t, &(handle.command_index as i64)],
+                            )
                             .unwrap();
                         scratch1
                             .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])
