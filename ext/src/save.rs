@@ -86,8 +86,7 @@ impl<F> SaveBackend_!(F, PostgresPool) {
             Self::Files(x) => SaveBackend::Files(x),
             #[cfg(feature = "database")]
             Self::Database(pool) => {
-                let connection = RUNTIME.block_on(pool.get()).unwrap();
-                SaveBackend::Database(connection)
+                RUNTIME.block_on(async { SaveBackend::Database(pool.get().await.unwrap()) })
             }
         }
     }

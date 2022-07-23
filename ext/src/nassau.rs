@@ -47,7 +47,12 @@ use crate::save::{PostgresConnection, RUNTIME};
 #[cfg(feature = "database")]
 use deadpool_postgres::tokio_postgres as postgres;
 #[cfg(feature = "database")]
-use deadpool_postgres::tokio_postgres::types::Type as PostgresType;
+use deadpool_postgres::tokio_postgres::types::{ToSql, Type as PostgresType};
+#[cfg(feature = "database")]
+use futures::{
+    future::FutureExt,
+    prelude::stream::{FuturesUnordered, TryStreamExt},
+};
 
 #[cfg(feature = "concurrent")]
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
@@ -68,6 +73,21 @@ impl SenderData {
             })
             .unwrap()
     }
+}
+
+#[cfg(feature = "database")]
+async fn execute_owned<'a, S: ToSql + Sync, T: ToSql + Sync, U: ToSql + Sync, V: ToSql + Sync>(
+    transaction: &deadpool_postgres::Transaction<'a>,
+    statement: postgres::Statement,
+    s: S,
+    t: T,
+    u: U,
+    v: V,
+) -> Result<(), postgres::Error> {
+    transaction
+        .execute(&statement, &[&s, &t, &u, &v])
+        .map(|r| r.map(|_| {}))
+        .await
 }
 
 #[cfg(feature = "database")]
@@ -565,36 +585,49 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database((handle, _)) => {
-                        RUNTIME.block_on(handle.transaction.execute(
-                            &handle.command_statement,
-                            &[
-                                &s,
-                                &t,
-                                &(handle.command_index as i64),
-                                &(Magic::Signature as i64),
-                            ],
-                        ))?;
-
-                        #[cfg(feature = "odd-primes")]
-                        RUNTIME.block_on(handle.transaction.execute(
-                            &handle.signature_statement,
-                            &[&s, &t, &(handle.command_index as i64), &signature],
-                        ))?;
-                        #[cfg(not(feature = "odd-primes"))]
-                        {
-                            let transmuted = unsafe {
-                                std::slice::from_raw_parts(
-                                    signature.as_ptr() as *const i16,
-                                    signature.len(),
+                        RUNTIME.block_on(async {
+                            handle
+                                .transaction
+                                .execute(
+                                    &handle.command_statement,
+                                    &[
+                                        &s,
+                                        &t,
+                                        &(handle.command_index as i64),
+                                        &(Magic::Signature as i64),
+                                    ],
                                 )
-                            };
-                            RUNTIME.block_on(handle.transaction.execute(
-                                &handle.signature_statement,
-                                &[&s, &t, &(handle.command_index as i64), &transmuted],
-                            ))?;
-                        }
+                                .await?;
 
-                        handle.command_index += 1;
+                            #[cfg(feature = "odd-primes")]
+                            handle
+                                .transaction
+                                .execute(
+                                    &handle.signature_statement,
+                                    &[&s, &t, &(handle.command_index as i64), &signature],
+                                )
+                                .await?;
+                            #[cfg(not(feature = "odd-primes"))]
+                            {
+                                let transmuted = unsafe {
+                                    std::slice::from_raw_parts(
+                                        signature.as_ptr() as *const i16,
+                                        signature.len(),
+                                    )
+                                };
+                                handle
+                                    .transaction
+                                    .execute(
+                                        &handle.signature_statement,
+                                        &[&s, &t, &(handle.command_index as i64), &transmuted],
+                                    )
+                                    .await?;
+                            }
+
+                            handle.command_index += 1;
+
+                            Ok::<_, anyhow::Error>(())
+                        })?;
                     }
                 }
             }
@@ -703,65 +736,77 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
                 #[cfg(feature = "database")]
                 SaveBackend::Database(mut connection) => {
-                    // To emulate a non-overwriting behavior, if the metadata for this differential
-                    // already exists, we just do some validity checks and return.
-                    let row = RUNTIME
-                        .block_on(connection.query_opt(
-                            "
-                            SELECT num_gens, target_dim, s, t
-                                FROM nassau_differential.metadata WHERE s = $1 AND t = $2
-                            ",
-                            &[&s, &t],
-                        ))
-                        .unwrap();
-                    if let Some(row) = row {
-                        assert_eq!(num_new_gens, row.get::<_, i64>(0) as usize);
-                        assert_eq!(target_dim, row.get::<_, i64>(1) as usize);
-                        return;
-                    }
-
-                    let transaction = RUNTIME.block_on(connection.transaction()).unwrap();
-
-                    RUNTIME
-                        .block_on(transaction.execute(
-                            "
-                            INSERT INTO nassau_differential.metadata
-                                (s, t, num_gens, target_dim)
-                                VALUES ($1, $2, $3, $4)
-                            ",
-                            &[&s, &t, &(num_new_gens as i64), &(target_dim as i64)],
-                        ))
-                        .unwrap();
-
-                    let mut buffer = Vec::new();
-                    let statement = RUNTIME
-                        .block_on(transaction.prepare_typed(
-                            "
-                            INSERT INTO nassau_differential.vectors (s, t, i, bytes)
-                                VALUES ($1, $2, $3, $4)
-                            ",
-                            &[
-                                PostgresType::OID,
-                                PostgresType::INT4,
-                                PostgresType::INT8,
-                                PostgresType::BYTEA,
-                            ],
-                        ))
-                        .unwrap();
-                    for n in 0..num_new_gens {
-                        buffer.clear();
-                        self.differential(s)
-                            .output(t, n)
-                            .to_bytes(&mut buffer)
-                            .unwrap();
-                        RUNTIME
-                            .block_on(
-                                transaction.execute(&statement, &[&s, &t, &(n as i64), &buffer]),
+                    RUNTIME.block_on(async {
+                        // To emulate a non-overwriting behavior, if the metadata for this differential
+                        // already exists, we just do some validity checks and return.
+                        let row = connection
+                            .query_opt(
+                                "
+                                SELECT num_gens, target_dim, s, t
+                                    FROM nassau_differential.metadata WHERE s = $1 AND t = $2
+                                ",
+                                &[&s, &t],
                             )
+                            .await
                             .unwrap();
-                    }
+                        if let Some(row) = row {
+                            assert_eq!(num_new_gens, row.get::<_, i64>(0) as usize);
+                            assert_eq!(target_dim, row.get::<_, i64>(1) as usize);
+                            return;
+                        }
 
-                    RUNTIME.block_on(transaction.commit()).unwrap();
+                        let transaction = connection.transaction().await.unwrap();
+
+                        transaction
+                            .execute(
+                                "
+                                INSERT INTO nassau_differential.metadata
+                                    (s, t, num_gens, target_dim)
+                                    VALUES ($1, $2, $3, $4)
+                                ",
+                                &[&s, &t, &(num_new_gens as i64), &(target_dim as i64)],
+                            )
+                            .await
+                            .unwrap();
+                        let statement = transaction
+                            .prepare_typed(
+                                "
+                                INSERT INTO nassau_differential.vectors (s, t, i, bytes)
+                                    VALUES ($1, $2, $3, $4)
+                                ",
+                                &[
+                                    PostgresType::OID,
+                                    PostgresType::INT4,
+                                    PostgresType::INT8,
+                                    PostgresType::BYTEA,
+                                ],
+                            )
+                            .await
+                            .unwrap();
+
+                        let fu = FuturesUnordered::new();
+
+                        for i in 0..num_new_gens {
+                            let mut buffer = Vec::new();
+                            self.differential(s)
+                                .output(t, i)
+                                .to_bytes(&mut buffer)
+                                .unwrap();
+                            let statement = statement.clone();
+                            fu.push(execute_owned(
+                                &transaction,
+                                statement.clone(),
+                                s,
+                                t,
+                                i as i64,
+                                buffer,
+                            ));
+                        }
+
+                        fu.try_collect::<Vec<()>>().await.unwrap();
+
+                        transaction.commit().await.unwrap()
+                    })
                 }
             }
         }
@@ -816,108 +861,117 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
                 #[cfg(feature = "database")]
                 SaveBackend::Database(connection) => {
-                    // We delete existing data for this bidegree to emulate the
-                    // overwriting behavior.
-                    // Deleting the metadata is sufficient because the rest will
-                    // be cleaned up by the `CASCADE` mechanism.
-                    RUNTIME
-                        .block_on(connection.execute(
-                            "DELETE FROM nassau_qi.metadata WHERE s = $1 AND t = $2",
-                            &[&s, &t],
-                        ))
-                        .unwrap();
+                    RUNTIME.block_on(async {
+                        // We delete existing data for this bidegree to emulate the
+                        // overwriting behavior.
+                        // Deleting the metadata is sufficient because the rest will
+                        // be cleaned up by the `CASCADE` mechanism.
+                        connection
+                            .execute(
+                                "DELETE FROM nassau_qi.metadata WHERE s = $1 AND t = $2",
+                                &[&s, &t],
+                            )
+                            .await
+                            .unwrap();
 
-                    let transaction = RUNTIME.block_on(connection.transaction()).unwrap();
+                        let transaction = connection.transaction().await.unwrap();
 
-                    RUNTIME
-                        .block_on(transaction.execute(
-                            "
-                            INSERT INTO nassau_qi.metadata(
-                                s, t, target_dim, target_masked_dim, subalgebra_profile
-                            ) VALUES ($1, $2, $3, $4, $5)
-                            ",
-                            &[
-                                &s,
-                                &t,
-                                &(next.dimension(t) as i64),
-                                &(target_masked_dim as i64),
-                                &subalgebra.profile,
-                            ],
-                        ))
-                        .unwrap();
+                        transaction
+                            .execute(
+                                "
+                                INSERT INTO nassau_qi.metadata(
+                                    s, t, target_dim, target_masked_dim, subalgebra_profile
+                                ) VALUES ($1, $2, $3, $4, $5)
+                                ",
+                                &[
+                                    &s,
+                                    &t,
+                                    &(next.dimension(t) as i64),
+                                    &(target_masked_dim as i64),
+                                    &subalgebra.profile,
+                                ],
+                            )
+                            .await
+                            .unwrap();
 
-                    let command_statement = RUNTIME
-                        .block_on(transaction.prepare_typed(
-                            "
+                        let command_statement = transaction
+                            .prepare_typed(
+                                "
                                 INSERT INTO nassau_qi.commands(s, t, i, magic)
                                     VALUES ($1, $2, $3, $4)
                                 ",
-                            &[
-                                PostgresType::OID,
-                                PostgresType::INT4,
-                                PostgresType::INT8,
-                                PostgresType::INT8,
-                            ],
-                        ))
-                        .unwrap();
-                    let entries_type = match std::mem::size_of::<PPartEntry>() {
-                        2 => PostgresType::INT2_ARRAY,
-                        4 => PostgresType::OID_ARRAY,
-                        _ => unreachable!(),
-                    };
-                    let signature_statement = RUNTIME
-                        .block_on(transaction.prepare_typed(
-                            "
-                            INSERT INTO nassau_qi.signatures(s, t, i, entries)
-                                VALUES ($1, $2, $3, $4)
-                            ",
-                            &[
-                                PostgresType::OID,
-                                PostgresType::INT4,
-                                PostgresType::INT8,
-                                entries_type,
-                            ],
-                        ))
-                        .unwrap();
-                    let lift_statement = RUNTIME
-                        .block_on(transaction.prepare_typed(
-                            "
-                            INSERT INTO nassau_qi.lifts(s, t, i, bytes)
-                                VALUES ($1, $2, $3, $4)
-                            ",
-                            &[
-                                PostgresType::OID,
-                                PostgresType::INT4,
-                                PostgresType::INT8,
-                                PostgresType::BYTEA,
-                            ],
-                        ))
-                        .unwrap();
-                    let image_statement = RUNTIME
-                        .block_on(transaction.prepare_typed(
-                            "INSERT INTO nassau_qi.images(s, t, i, bytes)
-                                VALUES ($1, $2, $3, $4)
-                            ",
-                            &[
-                                PostgresType::OID,
-                                PostgresType::INT4,
-                                PostgresType::INT8,
-                                PostgresType::BYTEA,
-                            ],
-                        ))
-                        .unwrap();
+                                &[
+                                    PostgresType::OID,
+                                    PostgresType::INT4,
+                                    PostgresType::INT8,
+                                    PostgresType::INT8,
+                                ],
+                            )
+                            .await
+                            .unwrap();
+                        let entries_type = match std::mem::size_of::<PPartEntry>() {
+                            2 => PostgresType::INT2_ARRAY,
+                            4 => PostgresType::OID_ARRAY,
+                            _ => unreachable!(),
+                        };
+                        let signature_statement = transaction
+                            .prepare_typed(
+                                "
+                                INSERT INTO nassau_qi.signatures(s, t, i, entries)
+                                    VALUES ($1, $2, $3, $4)
+                                ",
+                                &[
+                                    PostgresType::OID,
+                                    PostgresType::INT4,
+                                    PostgresType::INT8,
+                                    entries_type,
+                                ],
+                            )
+                            .await
+                            .unwrap();
+                        let lift_statement = transaction
+                            .prepare_typed(
+                                "
+                                INSERT INTO nassau_qi.lifts(s, t, i, bytes)
+                                    VALUES ($1, $2, $3, $4)
+                                ",
+                                &[
+                                    PostgresType::OID,
+                                    PostgresType::INT4,
+                                    PostgresType::INT8,
+                                    PostgresType::BYTEA,
+                                ],
+                            )
+                            .await
+                            .unwrap();
+                        let image_statement = transaction
+                            .prepare_typed(
+                                "
+                                INSERT INTO nassau_qi.images(s, t, i, bytes)
+                                    VALUES ($1, $2, $3, $4)
+                                ",
+                                &[
+                                    PostgresType::OID,
+                                    PostgresType::INT4,
+                                    PostgresType::INT8,
+                                    PostgresType::BYTEA,
+                                ],
+                            )
+                            .await
+                            .unwrap();
 
-                    let command_index = 0;
-                    let buffer: Vec<u8> = Vec::new();
+                        let command_index = 0;
+                        let buffer: Vec<u8> = Vec::new();
 
-                    SaveBackend::Database(PostgresQiWriteHandle {
-                        transaction,
-                        signature_statement,
-                        command_statement,
-                        lift_statement,
-                        image_statement,
-                        command_index,
-                        buffer,
+                        SaveBackend::Database(PostgresQiWriteHandle {
+                            transaction,
+                            signature_statement,
+                            command_statement,
+                            lift_statement,
+                            image_statement,
+                            command_index,
+                            buffer,
+                        })
                     })
                 }
             }
@@ -1063,15 +1117,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(handle) => {
-                    RUNTIME
-                        .block_on(handle.transaction.execute(
+                SaveBackend::Database(handle) => RUNTIME.block_on(async {
+                    handle
+                        .transaction
+                        .execute(
                             &handle.command_statement,
                             &[&s, &t, &(handle.command_index as i64), &(Magic::End as i64)],
-                        ))
+                        )
+                        .await
                         .unwrap();
-                    RUNTIME.block_on(handle.transaction.commit()).unwrap();
-                }
+                    handle.transaction.commit().await.unwrap();
+                }),
             }
         }
 
@@ -1207,24 +1263,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         (SaveBackend::Files(f), num, dim)
                     }),
                 #[cfg(feature = "database")]
-                SaveBackend::Database(connection) => {
-                    let transaction = RUNTIME
-                        .block_on(
-                            connection
-                                .build_transaction()
-                                .read_only(true)
-                                .isolation_level(postgres::IsolationLevel::Serializable)
-                                .start(),
-                        )
+                SaveBackend::Database(connection) => RUNTIME.block_on(async {
+                    let transaction = connection
+                        .build_transaction()
+                        .read_only(true)
+                        .isolation_level(postgres::IsolationLevel::Serializable)
+                        .start()
+                        .await
                         .unwrap();
-                    RUNTIME
-                        .block_on(transaction.query_one(
+                    transaction
+                        .query_one(
                             "
                             SELECT num_gens, target_dim, s, t
                                 FROM nassau_differential.metadata WHERE s = $1 AND t = $2
                             ",
                             &[&s, &t],
-                        ))
+                        )
+                        .await
                         .ok()
                         .map(|row| {
                             (
@@ -1233,7 +1288,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 row.get::<_, i64>(1) as usize,
                             )
                         })
-                }
+                }),
             };
 
             // `saved_target_res_dimension` need not be equal to `target_res_dimension`. If we
@@ -1254,15 +1309,16 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         }
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(transaction) => {
-                        let rows = RUNTIME
-                            .block_on(transaction.query(
+                    SaveBackend::Database(transaction) => RUNTIME.block_on(async {
+                        let rows = transaction
+                            .query(
                                 "
                                 SELECT bytes, s, t, i FROM nassau_differential.vectors
                                     WHERE s = $1 AND t = $2 ORDER BY i ASC
                                 ",
                                 &[&s, &t],
-                            ))
+                            )
+                            .await
                             .unwrap();
                         d_targets.extend(rows.iter().map(|v| {
                             FpVector::from_bytes(
@@ -1272,8 +1328,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             )
                             .unwrap()
                         }));
-                        RUNTIME.block_on(transaction.commit()).unwrap();
-                    }
+                        transaction.commit().await.unwrap();
+                    }),
                 }
 
                 self.differentials[s].add_generators_from_rows(t, d_targets);
