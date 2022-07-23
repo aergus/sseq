@@ -4,7 +4,7 @@
 /// branch into `master`.
 use ext::{chain_complex::FreeChainComplex, save::SaveBackend, utils, utils::construct_nassau};
 
-use r2d2_postgres::{postgres, r2d2, PostgresConnectionManager};
+use deadpool_postgres::{tokio_postgres::NoTls, Manager, ManagerConfig, Pool};
 
 fn main() -> anyhow::Result<()> {
     let (name, module): (String, utils::Config) = query::with_default("Module", "S_2", |s| {
@@ -14,11 +14,8 @@ fn main() -> anyhow::Result<()> {
     let save_target = query::optional(
         "Connection string in the sense of https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING",
         |s|  {
-            let manager = PostgresConnectionManager::new(
-                s.parse().unwrap(),
-                postgres::NoTls,
-            );
-            r2d2::Pool::new(manager).map(SaveBackend::Database)
+            let manager = Manager::from_config(s.parse().unwrap(), NoTls, ManagerConfig::default());
+            Pool::builder(manager).build().map(SaveBackend::Database)
         }
     );
 

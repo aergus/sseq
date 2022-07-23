@@ -43,9 +43,11 @@ use once::OnceVec;
 use std::sync::mpsc;
 
 #[cfg(feature = "database")]
-use crate::save::PostgresConnection;
+use crate::save::{PostgresConnection, RUNTIME};
 #[cfg(feature = "database")]
-use r2d2_postgres::{postgres, postgres::types::Type as PostgresType};
+use deadpool_postgres::tokio_postgres as postgres;
+#[cfg(feature = "database")]
+use deadpool_postgres::tokio_postgres::types::Type as PostgresType;
 
 #[cfg(feature = "concurrent")]
 /// See [`resolution::SenderData`](../resolution/struct.SenderData.html). This differs by not having the `new` field.
@@ -72,7 +74,7 @@ impl SenderData {
 /// Some data that we need to pass around while writing quasi-inverses into the database
 struct PostgresQiWriteHandle<'a> {
     command_index: usize,
-    transaction: postgres::Transaction<'a>,
+    transaction: deadpool_postgres::Transaction<'a>,
     command_statement: postgres::Statement,
     signature_statement: postgres::Statement,
     lift_statement: postgres::Statement,
@@ -563,7 +565,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database((handle, _)) => {
-                        handle.transaction.execute(
+                        RUNTIME.block_on(handle.transaction.execute(
                             &handle.command_statement,
                             &[
                                 &s,
@@ -571,13 +573,13 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 &(handle.command_index as i64),
                                 &(Magic::Signature as i64),
                             ],
-                        )?;
+                        ))?;
 
                         #[cfg(feature = "odd-primes")]
-                        handle.transaction.execute(
+                        RUNTIME.block_on(handle.transaction.execute(
                             &handle.signature_statement,
                             &[&s, &t, &(handle.command_index as i64), &signature],
-                        )?;
+                        ))?;
                         #[cfg(not(feature = "odd-primes"))]
                         {
                             let transmuted = unsafe {
@@ -586,10 +588,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     signature.len(),
                                 )
                             };
-                            handle.transaction.execute(
+                            RUNTIME.block_on(handle.transaction.execute(
                                 &handle.signature_statement,
                                 &[&s, &t, &(handle.command_index as i64), &transmuted],
-                            )?;
+                            ))?;
                         }
 
                         handle.command_index += 1;
@@ -609,7 +611,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database((handle, _)) => {
-                        handle.transaction.execute(
+                        RUNTIME.block_on(handle.transaction.execute(
                             &handle.command_statement,
                             &[
                                 &s,
@@ -617,7 +619,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 &(handle.command_index as i64),
                                 &(next_mask[col] as i64),
                             ],
-                        )?;
+                        ))?;
                     }
                 };
 
@@ -632,10 +634,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     SaveBackend::Database((handle, _)) => {
                         handle.buffer.clear();
                         scratch.to_bytes(&mut handle.buffer)?;
-                        handle.transaction.execute(
+                        RUNTIME.block_on(handle.transaction.execute(
                             &handle.lift_statement,
                             &[&s, &t, &(handle.command_index as i64), &handle.buffer],
-                        )?;
+                        ))?;
                     }
                 }
 
@@ -651,10 +653,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     SaveBackend::Database((handle, _)) => {
                         handle.buffer.clear();
                         scratch.to_bytes(&mut handle.buffer)?;
-                        handle.transaction.execute(
+                        RUNTIME.block_on(handle.transaction.execute(
                             &handle.image_statement,
                             &[&s, &t, &(handle.command_index as i64), &handle.buffer],
-                        )?;
+                        ))?;
                         handle.command_index += 1;
                     }
                 }
@@ -703,14 +705,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 SaveBackend::Database(mut connection) => {
                     // To emulate a non-overwriting behavior, if the metadata for this differential
                     // already exists, we just do some validity checks and return.
-                    let row = connection
-                        .query_opt(
+                    let row = RUNTIME
+                        .block_on(connection.query_opt(
                             "
                             SELECT num_gens, target_dim, s, t
                                 FROM nassau_differential.metadata WHERE s = $1 AND t = $2
                             ",
                             &[&s, &t],
-                        )
+                        ))
                         .unwrap();
                     if let Some(row) = row {
                         assert_eq!(num_new_gens, row.get::<_, i64>(0) as usize);
@@ -718,22 +720,22 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         return;
                     }
 
-                    let mut transaction = connection.transaction().unwrap();
+                    let transaction = RUNTIME.block_on(connection.transaction()).unwrap();
 
-                    transaction
-                        .execute(
+                    RUNTIME
+                        .block_on(transaction.execute(
                             "
                             INSERT INTO nassau_differential.metadata
                                 (s, t, num_gens, target_dim)
                                 VALUES ($1, $2, $3, $4)
                             ",
                             &[&s, &t, &(num_new_gens as i64), &(target_dim as i64)],
-                        )
+                        ))
                         .unwrap();
 
                     let mut buffer = Vec::new();
-                    let statement = transaction
-                        .prepare_typed(
+                    let statement = RUNTIME
+                        .block_on(transaction.prepare_typed(
                             "
                             INSERT INTO nassau_differential.vectors (s, t, i, bytes)
                                 VALUES ($1, $2, $3, $4)
@@ -744,7 +746,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 PostgresType::INT8,
                                 PostgresType::BYTEA,
                             ],
-                        )
+                        ))
                         .unwrap();
                     for n in 0..num_new_gens {
                         buffer.clear();
@@ -752,12 +754,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             .output(t, n)
                             .to_bytes(&mut buffer)
                             .unwrap();
-                        transaction
-                            .execute(&statement, &[&s, &t, &(n as i64), &buffer])
+                        RUNTIME
+                            .block_on(
+                                transaction.execute(&statement, &[&s, &t, &(n as i64), &buffer]),
+                            )
                             .unwrap();
                     }
 
-                    transaction.commit().unwrap();
+                    RUNTIME.block_on(transaction.commit()).unwrap();
                 }
             }
         }
@@ -816,17 +820,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     // overwriting behavior.
                     // Deleting the metadata is sufficient because the rest will
                     // be cleaned up by the `CASCADE` mechanism.
-                    connection
-                        .execute(
+                    RUNTIME
+                        .block_on(connection.execute(
                             "DELETE FROM nassau_qi.metadata WHERE s = $1 AND t = $2",
                             &[&s, &t],
-                        )
+                        ))
                         .unwrap();
 
-                    let mut transaction = connection.transaction().unwrap();
+                    let transaction = RUNTIME.block_on(connection.transaction()).unwrap();
 
-                    transaction
-                        .execute(
+                    RUNTIME
+                        .block_on(transaction.execute(
                             "
                             INSERT INTO nassau_qi.metadata(
                                 s, t, target_dim, target_masked_dim, subalgebra_profile
@@ -839,11 +843,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 &(target_masked_dim as i64),
                                 &subalgebra.profile,
                             ],
-                        )
+                        ))
                         .unwrap();
 
-                    let command_statement = transaction
-                        .prepare_typed(
+                    let command_statement = RUNTIME
+                        .block_on(transaction.prepare_typed(
                             "
                                 INSERT INTO nassau_qi.commands(s, t, i, magic)
                                     VALUES ($1, $2, $3, $4)
@@ -854,15 +858,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 PostgresType::INT8,
                                 PostgresType::INT8,
                             ],
-                        )
+                        ))
                         .unwrap();
                     let entries_type = match std::mem::size_of::<PPartEntry>() {
                         2 => PostgresType::INT2_ARRAY,
                         4 => PostgresType::OID_ARRAY,
                         _ => unreachable!(),
                     };
-                    let signature_statement = transaction
-                        .prepare_typed(
+                    let signature_statement = RUNTIME
+                        .block_on(transaction.prepare_typed(
                             "
                             INSERT INTO nassau_qi.signatures(s, t, i, entries)
                                 VALUES ($1, $2, $3, $4)
@@ -873,10 +877,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 PostgresType::INT8,
                                 entries_type,
                             ],
-                        )
+                        ))
                         .unwrap();
-                    let lift_statement = transaction
-                        .prepare_typed(
+                    let lift_statement = RUNTIME
+                        .block_on(transaction.prepare_typed(
                             "
                             INSERT INTO nassau_qi.lifts(s, t, i, bytes)
                                 VALUES ($1, $2, $3, $4)
@@ -887,10 +891,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 PostgresType::INT8,
                                 PostgresType::BYTEA,
                             ],
-                        )
+                        ))
                         .unwrap();
-                    let image_statement = transaction
-                        .prepare_typed(
+                    let image_statement = RUNTIME
+                        .block_on(transaction.prepare_typed(
                             "INSERT INTO nassau_qi.images(s, t, i, bytes)
                                 VALUES ($1, $2, $3, $4)
                             ",
@@ -900,7 +904,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 PostgresType::INT8,
                                 PostgresType::BYTEA,
                             ],
-                        )
+                        ))
                         .unwrap();
 
                     let command_index = 0;
@@ -956,12 +960,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database(handle) => {
-                        handle
-                            .transaction
-                            .execute(
+                        RUNTIME
+                            .block_on(handle.transaction.execute(
                                 &handle.command_statement,
                                 &[&s, &t, &(handle.command_index as i64), &(Magic::Fix as i64)],
-                            )
+                            ))
                             .unwrap();
                         handle.command_index += 1;
                     }
@@ -1060,15 +1063,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(mut handle) => {
-                    handle
-                        .transaction
-                        .execute(
+                SaveBackend::Database(handle) => {
+                    RUNTIME
+                        .block_on(handle.transaction.execute(
                             &handle.command_statement,
                             &[&s, &t, &(handle.command_index as i64), &(Magic::End as i64)],
-                        )
+                        ))
                         .unwrap();
-                    handle.transaction.commit().unwrap();
+                    RUNTIME.block_on(handle.transaction.commit()).unwrap();
                 }
             }
         }
@@ -1206,20 +1208,23 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     }),
                 #[cfg(feature = "database")]
                 SaveBackend::Database(connection) => {
-                    let mut transaction = connection
-                        .build_transaction()
-                        .read_only(true)
-                        .isolation_level(postgres::IsolationLevel::Serializable)
-                        .start()
+                    let transaction = RUNTIME
+                        .block_on(
+                            connection
+                                .build_transaction()
+                                .read_only(true)
+                                .isolation_level(postgres::IsolationLevel::Serializable)
+                                .start(),
+                        )
                         .unwrap();
-                    transaction
-                        .query_one(
+                    RUNTIME
+                        .block_on(transaction.query_one(
                             "
                             SELECT num_gens, target_dim, s, t
                                 FROM nassau_differential.metadata WHERE s = $1 AND t = $2
                             ",
                             &[&s, &t],
-                        )
+                        ))
                         .ok()
                         .map(|row| {
                             (
@@ -1249,15 +1254,15 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         }
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(mut transaction) => {
-                        let rows = transaction
-                            .query(
+                    SaveBackend::Database(transaction) => {
+                        let rows = RUNTIME
+                            .block_on(transaction.query(
                                 "
                                 SELECT bytes, s, t, i FROM nassau_differential.vectors
                                     WHERE s = $1 AND t = $2 ORDER BY i ASC
                                 ",
                                 &[&s, &t],
-                            )
+                            ))
                             .unwrap();
                         d_targets.extend(rows.iter().map(|v| {
                             FpVector::from_bytes(
@@ -1267,7 +1272,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             )
                             .unwrap()
                         }));
-                        transaction.commit().unwrap();
+                        RUNTIME.block_on(transaction.commit()).unwrap();
                     }
                 }
 
@@ -1445,67 +1450,70 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database(mut connection) => {
-                        let mut transaction = connection
-                            .build_transaction()
-                            .read_only(true)
-                            .isolation_level(postgres::IsolationLevel::Serializable)
-                            .start()
+                        let transaction = RUNTIME
+                            .block_on(
+                                connection
+                                    .build_transaction()
+                                    .read_only(true)
+                                    .isolation_level(postgres::IsolationLevel::Serializable)
+                                    .start(),
+                            )
                             .unwrap();
-                        let row = transaction
-                            .query_opt(
+                        let row = RUNTIME
+                            .block_on(transaction.query_opt(
                                 "
                                 SELECT target_dim, target_dim, subalgebra_profile
                                     FROM nassau_qi.metadata WHERE s = $1 AND t = $2
                                 ",
                                 &[&s, &t],
-                            )
+                            ))
                             .unwrap();
                         if let Some(row) = row {
                             let target_dim = row.get::<_, i64>(0) as usize;
                             let zero_mask_dim = row.get::<_, i64>(1) as usize;
                             let subalgebra = MilnorSubalgebra::new(row.get(2));
 
-                            let command_rows = transaction
-                                .query(
+                            let command_rows = RUNTIME
+                                .block_on(transaction.query(
                                     "
                                     SELECT magic FROM nassau_qi.commands
                                         WHERE s = $1 AND t = $2 ORDER BY i ASC
                                     ",
                                     &[&s, &t],
-                                )
+                                ))
                                 .unwrap();
                             // If we were pedantic, we could continue using the transaction while
                             // while reading command data, but as each command has a unique `id`,
                             // the worst that can happen is a `query_one` failing.
-                            transaction.commit().unwrap();
+                            RUNTIME.block_on(transaction.commit()).unwrap();
                             let command_index = 0;
 
-                            let signature_statement = connection
-                                .prepare_typed(
+                            let signature_statement = RUNTIME
+                                .block_on(connection.prepare_typed(
                                     "
                                     SELECT entries FROM nassau_qi.signatures
                                         WHERE s = $1 AND t = $2 AND i = $3
                                     ",
                                     &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
-                                )
+                                ))
                                 .unwrap();
-                            let lift_statement = connection
-                                .prepare_typed(
+                            let lift_statement = RUNTIME
+                                .block_on(connection.prepare_typed(
                                     "
                                     SELECT bytes FROM nassau_qi.lifts
                                         WHERE s = $1 AND t = $2 AND i = $3
                                     ",
                                     &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
-                                )
+                                ))
                                 .unwrap();
-                            let image_statement = connection
-                                .prepare_typed(
+                            let image_statement = RUNTIME
+                                .block_on(connection.prepare_typed(
                                     "
                                     SELECT bytes FROM nassau_qi.images WHERE command_id = $1
                                         WHERE s = $1 AND t = $2 AND i = $3
                                     ",
                                     &[PostgresType::OID, PostgresType::INT4, PostgresType::INT8],
-                                )
+                                ))
                                 .unwrap();
 
                             (
@@ -1603,12 +1611,11 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     SaveBackend::Files(f) => subalgebra.signature_from_bytes(f).unwrap(),
                     #[cfg(feature = "database")]
                     SaveBackend::Database(handle) => {
-                        let row = handle
-                            .connection
-                            .query_one(
+                        let row = RUNTIME
+                            .block_on(handle.connection.query_one(
                                 &handle.signature_statement,
                                 &[&s, &t, &(handle.command_index as i64)],
-                            )
+                            ))
                             .unwrap();
 
                         #[cfg(feature = "odd-primes")]
@@ -1672,22 +1679,20 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> ChainComplex for Resolution<M> {
                     }
                     #[cfg(feature = "database")]
                     SaveBackend::Database(handle) => {
-                        let row = handle
-                            .connection
-                            .query_one(
+                        let row = RUNTIME
+                            .block_on(handle.connection.query_one(
                                 &handle.lift_statement,
                                 &[&s, &t, &(handle.command_index as i64)],
-                            )
+                            ))
                             .unwrap();
                         scratch0
                             .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])
                             .unwrap();
-                        let row = handle
-                            .connection
-                            .query_one(
+                        let row = RUNTIME
+                            .block_on(handle.connection.query_one(
                                 &handle.image_statement,
                                 &[&s, &t, &(handle.command_index as i64)],
-                            )
+                            ))
                             .unwrap();
                         scratch1
                             .update_from_bytes(&mut &row.get::<_, Vec<u8>>(0)[..])

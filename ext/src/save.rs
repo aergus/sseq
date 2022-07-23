@@ -10,7 +10,13 @@ use algebra::Algebra;
 use anyhow::Context;
 
 #[cfg(feature = "database")]
-use r2d2_postgres::{postgres, r2d2, PostgresConnectionManager};
+use deadpool_postgres::tokio_postgres as postgres;
+#[cfg(feature = "database")]
+use once_cell::sync::Lazy;
+
+#[cfg(feature = "database")]
+pub static RUNTIME: Lazy<tokio::runtime::Runtime> =
+    Lazy::new(|| tokio::runtime::Runtime::new().expect("Cannot initialize Tokio runtime"));
 
 /// An `enum` with a variant for each method of saving data
 pub enum SaveBackend<F, #[cfg(feature = "database")] D> {
@@ -54,9 +60,9 @@ impl<F, #[cfg(feature = "database")] D> SaveBackend_!(F, D) {
 }
 
 #[cfg(feature = "database")]
-pub type PostgresPool = r2d2::Pool<PostgresConnectionManager<postgres::NoTls>>;
+pub type PostgresPool = deadpool_postgres::Pool;
 #[cfg(feature = "database")]
-pub type PostgresConnection = r2d2::PooledConnection<PostgresConnectionManager<postgres::NoTls>>;
+pub type PostgresConnection = deadpool_postgres::Object;
 
 /// A specialized version of [SaveBackend] that is used to describe where data should be written
 pub type SaveTarget = SaveBackend_!(PathBuf, PostgresPool);
@@ -79,7 +85,10 @@ impl<F> SaveBackend_!(F, PostgresPool) {
         match self {
             Self::Files(x) => SaveBackend::Files(x),
             #[cfg(feature = "database")]
-            Self::Database(pool) => SaveBackend::Database(pool.get().unwrap()),
+            Self::Database(pool) => {
+                let connection = RUNTIME.block_on(pool.get()).unwrap();
+                SaveBackend::Database(connection)
+            }
         }
     }
 }
@@ -215,7 +224,10 @@ impl SaveKind {
     }
 
     #[cfg(feature = "database")]
-    pub fn initialize_database(self, conn: &mut postgres::Client) -> Result<(), postgres::Error> {
+    pub fn initialize_database(
+        self,
+        client: &mut PostgresConnection,
+    ) -> Result<(), postgres::Error> {
         // Taking a detour through `String` because we have to format things...
         let query = match self {
             Self::NassauDifferential => String::from(
@@ -301,7 +313,7 @@ impl SaveKind {
             }
             _ => todo!(),
         };
-        conn.batch_execute(&query)
+        RUNTIME.block_on(client.batch_execute(&query))
     }
 }
 
