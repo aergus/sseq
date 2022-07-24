@@ -93,14 +93,11 @@ async fn execute_owned<'a, S: ToSql + Sync, T: ToSql + Sync, U: ToSql + Sync, V:
 #[cfg(feature = "database")]
 /// Some data that we need to pass around while writing quasi-inverses into the database
 struct PostgresQiWriteHandle<'a> {
-    command_index: usize,
     transaction: deadpool_postgres::Transaction<'a>,
     command_statement: postgres::Statement,
     signature_statement: postgres::Statement,
     lift_statement: postgres::Statement,
     image_statement: postgres::Statement,
-    /// Buffer for byte arrays representing `FpVector`s.
-    buffer: Vec<u8>,
 }
 
 #[cfg(feature = "database")]
@@ -551,7 +548,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
     }
 
     fn write_qi(
-        handle: Option<SaveBackend_!(&mut impl Write, &mut PostgresQiWriteHandle)>,
+        handle: Option<SaveBackend_!(&mut impl Write, (&PostgresQiWriteHandle, &mut usize))>,
         s: u32,
         t: i32,
         subalgebra: &MilnorSubalgebra,
@@ -565,9 +562,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
             let mut handle = match handle {
                 SaveBackend::Files(f) => SaveBackend::Files(LogWriter::new(f)),
                 #[cfg(feature = "database")]
-                SaveBackend::Database(handle) => {
+                SaveBackend::Database((handle, command_index)) => {
+                    let futures = FuturesUnordered::new();
                     let timer = Timer::start();
-                    SaveBackend::Database((handle, timer))
+                    SaveBackend::Database((handle, command_index, futures, timer))
                 }
             };
 
@@ -584,7 +582,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         MilnorSubalgebra::signature_to_bytes(signature, f)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database((handle, _)) => {
+                    SaveBackend::Database((handle, command_index, _, _)) => {
                         RUNTIME.block_on(async {
                             handle
                                 .transaction
@@ -593,7 +591,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     &[
                                         &s,
                                         &t,
-                                        &(handle.command_index as i64),
+                                        &(**command_index as i64),
                                         &(Magic::Signature as i64),
                                     ],
                                 )
@@ -604,7 +602,7 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                 .transaction
                                 .execute(
                                     &handle.signature_statement,
-                                    &[&s, &t, &(handle.command_index as i64), &signature],
+                                    &[&s, &t, &(**command_index as i64), &signature],
                                 )
                                 .await?;
                             #[cfg(not(feature = "odd-primes"))]
@@ -619,12 +617,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                                     .transaction
                                     .execute(
                                         &handle.signature_statement,
-                                        &[&s, &t, &(handle.command_index as i64), &transmuted],
+                                        &[&s, &t, &(**command_index as i64), &transmuted],
                                     )
                                     .await?;
                             }
 
-                            handle.command_index += 1;
+                            **command_index += 1;
 
                             Ok::<_, anyhow::Error>(())
                         })?;
@@ -643,15 +641,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         f.write_u64::<LittleEndian>(next_mask[col] as u64)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database((handle, _)) => {
+                    SaveBackend::Database((handle, command_index, _, _)) => {
                         RUNTIME.block_on(handle.transaction.execute(
                             &handle.command_statement,
-                            &[
-                                &s,
-                                &t,
-                                &(handle.command_index as i64),
-                                &(next_mask[col] as i64),
-                            ],
+                            &[&s, &t, &(**command_index as i64), &(next_mask[col] as i64)],
                         ))?;
                     }
                 };
@@ -664,13 +657,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         scratch.to_bytes(f)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database((handle, _)) => {
-                        handle.buffer.clear();
-                        scratch.to_bytes(&mut handle.buffer)?;
-                        RUNTIME.block_on(handle.transaction.execute(
-                            &handle.lift_statement,
-                            &[&s, &t, &(handle.command_index as i64), &handle.buffer],
-                        ))?;
+                    SaveBackend::Database((handle, command_index, futures, _)) => {
+                        let mut buffer = Vec::new();
+                        scratch.to_bytes(&mut buffer)?;
+                        futures.push(execute_owned(
+                            &handle.transaction,
+                            handle.lift_statement.clone(),
+                            s,
+                            t,
+                            **command_index as i64,
+                            buffer,
+                        ));
                     }
                 }
 
@@ -683,14 +680,18 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         scratch.to_bytes(f)?;
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database((handle, _)) => {
-                        handle.buffer.clear();
-                        scratch.to_bytes(&mut handle.buffer)?;
-                        RUNTIME.block_on(handle.transaction.execute(
-                            &handle.image_statement,
-                            &[&s, &t, &(handle.command_index as i64), &handle.buffer],
-                        ))?;
-                        handle.command_index += 1;
+                    SaveBackend::Database((handle, command_index, futures, _)) => {
+                        let mut buffer = Vec::new();
+                        scratch.to_bytes(&mut buffer)?;
+                        futures.push(execute_owned(
+                            &handle.transaction,
+                            handle.image_statement.clone(),
+                            s,
+                            t,
+                            **command_index as i64,
+                            buffer,
+                        ));
+                        **command_index += 1;
                     }
                 }
             }
@@ -703,7 +704,8 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     ));
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database((_, timer)) => {
+                SaveBackend::Database((_, _, futures, timer)) => {
+                    RUNTIME.block_on(futures.try_collect::<Vec<()>>()).unwrap();
                     timer.end(
                         format_args!(
                             "Inserted quasi-inverse for bidegree ({n}, {s}) and signature {signature:?}, with {subalgebra}",
@@ -961,17 +963,17 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                             .unwrap();
 
                         let command_index = 0;
-                        let buffer: Vec<u8> = Vec::new();
 
-                        SaveBackend::Database(PostgresQiWriteHandle {
-                            transaction,
-                            signature_statement,
-                            command_statement,
-                            lift_statement,
-                            image_statement,
+                        SaveBackend::Database((
+                            PostgresQiWriteHandle {
+                                transaction,
+                                signature_statement,
+                                command_statement,
+                                lift_statement,
+                                image_statement,
+                            },
                             command_index,
-                            buffer,
-                        })
+                        ))
                     })
                 }
             }
@@ -994,7 +996,10 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
         let kernel = masked_matrix.compute_kernel();
 
         Self::write_qi(
-            handle.as_mut().map(|b| b.as_mut()),
+            handle.as_mut().map(|handle| match handle {
+                SaveBackend::Files(f) => SaveBackend::Files(f),
+                SaveBackend::Database((handle, index)) => SaveBackend::Database((&*handle, index)),
+            }),
             s,
             t,
             &subalgebra,
@@ -1013,14 +1018,14 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                         f.write_u64::<LittleEndian>(Magic::Fix as u64).unwrap();
                     }
                     #[cfg(feature = "database")]
-                    SaveBackend::Database(handle) => {
+                    SaveBackend::Database((handle, command_index)) => {
                         RUNTIME
                             .block_on(handle.transaction.execute(
                                 &handle.command_statement,
-                                &[&s, &t, &(handle.command_index as i64), &(Magic::Fix as i64)],
+                                &[&s, &t, &(*command_index as i64), &(Magic::Fix as i64)],
                             ))
                             .unwrap();
-                        handle.command_index += 1;
+                        *command_index += 1;
                     }
                 }
             }
@@ -1092,7 +1097,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                 }
             }
             Self::write_qi(
-                handle.as_mut().map(|b| b.as_mut()),
+                handle.as_mut().map(|handle| match handle {
+                    SaveBackend::Files(f) => SaveBackend::Files(f),
+                    SaveBackend::Database((handle, index)) => {
+                        SaveBackend::Database((&*handle, index))
+                    }
+                }),
                 s,
                 t,
                 &subalgebra,
@@ -1117,12 +1127,12 @@ impl<M: ZeroModule<Algebra = MilnorAlgebra>> Resolution<M> {
                     f.write_u64::<LittleEndian>(Magic::End as u64).unwrap();
                 }
                 #[cfg(feature = "database")]
-                SaveBackend::Database(handle) => RUNTIME.block_on(async {
+                SaveBackend::Database((handle, command_index)) => RUNTIME.block_on(async {
                     handle
                         .transaction
                         .execute(
                             &handle.command_statement,
-                            &[&s, &t, &(handle.command_index as i64), &(Magic::End as i64)],
+                            &[&s, &t, &(command_index as i64), &(Magic::End as i64)],
                         )
                         .await
                         .unwrap();
