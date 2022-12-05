@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             .collect::<Vec<_>>();
 
         sseq.write_to_graph(
-            TikzBackend::new(std::io::stdout()),
+            &mut TikzBackend::new(std::io::stdout()),
             2,
             false,
             products.iter(),

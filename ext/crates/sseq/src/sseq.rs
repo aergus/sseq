@@ -475,7 +475,7 @@ impl<P: SseqProfile> Sseq<P> {
     /// This shifts the sseq horizontally so that the minimum x is 0.
     pub fn write_to_graph<'a, T: chart::Backend>(
         &self,
-        mut g: T,
+        g: &mut T,
         r: i32,
         differentials: bool,
         products: impl Iterator<Item = &'a (String, Product)> + Clone,
@@ -488,7 +488,7 @@ impl<P: SseqProfile> Sseq<P> {
         let max_y = self.max_y();
 
         g.init(max_x - min_x, max_y)?;
-        header(&mut g)?;
+        header(g)?;
 
         for x in min_x..=max_x {
             for y in self.range(x) {

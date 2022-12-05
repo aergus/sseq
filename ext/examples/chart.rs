@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     sseq.write_to_graph(
-        SvgBackend::new(std::io::stdout()),
+        &mut SvgBackend::new(std::io::stdout()),
         2,
         false,
         products.iter(),

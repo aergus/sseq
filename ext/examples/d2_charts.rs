@@ -25,13 +25,15 @@ fn main() -> anyhow::Result<()> {
 
     let write = |path, page, diff, prod| {
         const EXT: &str = Backend::<File>::EXT;
-        let backend = Backend::new(File::create(format!(
+        let mut backend = Backend::new(File::create(format!(
             "{}_{}.{}",
             path,
             resolution.name(),
             EXT
         ))?);
-        sseq.write_to_graph(backend, page, diff, products.iter().take(prod), |_| Ok(()))?;
+        sseq.write_to_graph(&mut backend, page, diff, products.iter().take(prod), |_| {
+            Ok(())
+        })?;
         <Result<(), std::io::Error>>::Ok(())
     };
 

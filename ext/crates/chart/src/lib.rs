@@ -179,7 +179,7 @@ impl<T: Write> SvgBackend<T> {
     }
 
     /// Returns r, x, y
-    fn get_coords(&self, x: i32, y: i32, i: usize) -> (f32, f32, f32) {
+    pub fn get_coords(&self, x: i32, y: i32, i: usize) -> (f32, f32, f32) {
         let n = *self.num_nodes.get(&(x, y)).unwrap();
 
         let (radius, patterns) = PATTERNS[n - 1];
