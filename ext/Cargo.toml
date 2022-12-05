@@ -10,6 +10,7 @@ resolver = "2"
 
 [dependencies]
 algebra = { path = "crates/algebra", default-features = false, features = ["json"] }
+clap = {version ="4.0", features=["derive"]} # needed on the `ami-chart` branch
 bivec = { path = "crates/bivec"}
 fp = { path = "crates/fp", default-features = false }
 once = { path = "crates/once"}
